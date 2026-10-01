@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Codex Local Remote</string>
+    <string name="title_activity_main">Codex Local Remote</string>
+    <string name="package_name">com.wlyaaaaa.codexlocalremote.mobile</string>
+    <string name="custom_url_scheme">com.wlyaaaaa.codexlocalremote.mobile</string>
+    <string name="runtime_log_path">Log file:</string>
+    <string name="runtime_log_unavailable">Unavailable</string>
+    <string name="close">Close</string>
+    <string name="renderer_process_exited">Web renderer exited</string>
+    <string name="web_runtime_error">Web runtime error</string>
+</resources>

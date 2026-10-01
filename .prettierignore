@@ -1,0 +1,8 @@
+dist
+coverage
+playwright-report
+test-results
+pnpm-lock.yaml
+packages/app-server-client/schema
+apps/mobile/android
+apps/mobile/ios

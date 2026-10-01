@@ -1,0 +1,954 @@
+import type {
+  ConversationAttachment,
+  ConversationItem,
+  RemoteEvent,
+  ThreadDetail,
+  ThreadSummary,
+} from "@codex-local-remote/contracts";
+
+export interface ThreadNavigationState {
+  initialPrompt?: string;
+  threadSeed: ThreadDetail;
+}
+
+export interface ThreadCreationMergeContext {
+  creationSeed?: ThreadDetail;
+  initialPrompt?: string;
+  liveAliasItemId?: string;
+}
+
+const threadModes = new Set(["desktop-snapshot", "managed"]);
+const runStates = new Set([
+  "idle",
+  "running",
+  "waiting-for-approval",
+  "interrupted",
+  "failed",
+  "complete",
+]);
+const threadNavigationCacheMaxAgeMs = 6 * 60 * 60 * 1000;
+
+export function sortThreadsForDisplay<T extends ThreadSummary>(threads: readonly T[]): T[] {
+  return [...threads].sort((left, right) => {
+    const leftPinned = left.pinnedRank;
+    const rightPinned = right.pinnedRank;
+    if (leftPinned !== undefined || rightPinned !== undefined) {
+      if (leftPinned === undefined) return 1;
+      if (rightPinned === undefined) return -1;
+      if (leftPinned !== rightPinned) return leftPinned - rightPinned;
+    }
+    return right.updatedAt.localeCompare(left.updatedAt);
+  });
+}
+
+export function sortThreadsByRecentActivity<T extends ThreadSummary>(threads: readonly T[]): T[] {
+  return [...threads].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function threadSeedFromNavigationState(
+  state: unknown,
+  threadId: string,
+): ThreadDetail | undefined {
+  const candidate = asRecord(state).threadSeed;
+  return isThreadDetail(candidate) && candidate.id === threadId ? candidate : undefined;
+}
+
+export function threadInitialPromptFromNavigationState(
+  state: unknown,
+  threadId: string,
+): string | undefined {
+  const record = asRecord(state);
+  const seed = threadSeedFromNavigationState(record, threadId);
+  if (!seed) return undefined;
+  return typeof record.initialPrompt === "string" && record.initialPrompt.length > 0
+    ? record.initialPrompt
+    : firstUserMessage(seed.items)?.text;
+}
+
+export function threadNavigationState(
+  threadSeed: ThreadDetail,
+  initialPrompt?: string,
+): ThreadNavigationState {
+  return {
+    threadSeed,
+    ...(initialPrompt === undefined ? {} : { initialPrompt }),
+  };
+}
+
+export function compactThreadNavigationState(
+  thread: ThreadDetail,
+  initialPrompt?: string,
+): ThreadNavigationState {
+  const firstPromptItem =
+    initialPrompt === undefined
+      ? undefined
+      : thread.items.find((item) => item.kind === "user-message" && item.text === initialPrompt);
+  return threadNavigationState(
+    {
+      ...thread,
+      items: firstPromptItem ? [firstPromptItem] : [],
+    },
+    initialPrompt,
+  );
+}
+
+export function readThreadNavigationCache(
+  storage: Pick<Storage, "getItem" | "removeItem">,
+  threadId: string,
+  now = Date.now(),
+): ThreadNavigationState | undefined {
+  const key = threadNavigationCacheKey(threadId);
+  try {
+    const record = asRecord(JSON.parse(storage.getItem(key) ?? "null"));
+    const cachedAt = typeof record.cachedAt === "number" ? record.cachedAt : Number.NaN;
+    if (
+      !Number.isFinite(cachedAt) ||
+      cachedAt > now ||
+      now - cachedAt > threadNavigationCacheMaxAgeMs
+    ) {
+      storage.removeItem(key);
+      return undefined;
+    }
+    const state = asRecord(record.state);
+    const threadSeed = threadSeedFromNavigationState(state, threadId);
+    if (!threadSeed) {
+      storage.removeItem(key);
+      return undefined;
+    }
+    const initialPrompt = threadInitialPromptFromNavigationState(state, threadId);
+    return {
+      threadSeed,
+      ...(initialPrompt === undefined ? {} : { initialPrompt }),
+    };
+  } catch {
+    storage.removeItem(key);
+    return undefined;
+  }
+}
+
+export function writeThreadNavigationCache(
+  storage: Pick<Storage, "setItem">,
+  state: ThreadNavigationState,
+  now = Date.now(),
+): void {
+  try {
+    storage.setItem(
+      threadNavigationCacheKey(state.threadSeed.id),
+      JSON.stringify({ cachedAt: now, state }),
+    );
+  } catch {
+    // A full or disabled session store must never block the task view.
+  }
+}
+
+function threadNavigationCacheKey(threadId: string): string {
+  return `thread-navigation:${encodeURIComponent(threadId)}`;
+}
+
+export function mergeThreadRefresh(
+  current: ThreadDetail | undefined,
+  incoming: ThreadDetail,
+  creation?: ThreadCreationMergeContext,
+): ThreadDetail {
+  if (!current || current.id !== incoming.id) {
+    return incoming;
+  }
+
+  const freshness = compareUpdatedAt(incoming.updatedAt, current.updatedAt);
+  const advancesThreadLifecycle = incomingAdvancesThreadLifecycle(current, incoming);
+  const advancesToolLifecycle = incomingAdvancesToolLifecycle(current.items, incoming.items);
+  const preserveCurrentActiveControl =
+    isActiveThreadState(current.state) &&
+    isTerminalThreadState(incoming.state) &&
+    incoming.activeTurnId === undefined &&
+    !advancesToolLifecycle &&
+    !advancesThreadLifecycle;
+  const preferIncoming =
+    freshness > 0 ||
+    incomingHydratesSummaryPlaceholder(current, incoming) ||
+    advancesToolLifecycle ||
+    advancesThreadLifecycle;
+  const reconcileTerminalTextAliases =
+    isTerminalThreadState(incoming.state) &&
+    (advancesThreadLifecycle ||
+      (!isActiveThreadState(current.state) && incomingCoversLatestUser(current, incoming)));
+  const base = preferIncoming ? incoming : current;
+  const mergedItems = mergeConversationItems(
+    incoming.items,
+    current.items,
+    preferIncoming,
+    reconcileTerminalTextAliases,
+    advancesThreadLifecycle,
+  );
+  const items = reconcileCreationSeedFirstUserMessage(mergedItems, incoming, creation);
+
+  const merged =
+    base === current && sameItemSequence(items, current.items)
+      ? current
+      : base === incoming && sameItemSequence(items, incoming.items)
+        ? incoming
+        : { ...base, items };
+  if (!preserveCurrentActiveControl) return merged;
+  const { activeTurnId: _incomingActiveTurnId, ...withoutIncomingActiveTurn } = merged;
+  return {
+    ...withoutIncomingActiveTurn,
+    state: current.state,
+    availableActions: current.availableActions,
+    ...(current.activeTurnId === undefined ? {} : { activeTurnId: current.activeTurnId }),
+  };
+}
+
+export function mergeAuthoritativeThreadControl(
+  current: ThreadDetail | undefined,
+  incoming: ThreadDetail,
+  creation?: ThreadCreationMergeContext,
+): ThreadDetail {
+  const merged = mergeThreadRefresh(current, incoming, creation);
+  const {
+    activeTurnId: _staleActiveTurnId,
+    model: _staleModel,
+    reasoningEffort: _staleReasoningEffort,
+    serviceTier: _staleServiceTier,
+    permissionProfileId: _stalePermissionProfileId,
+    approvalPolicy: _staleApprovalPolicy,
+    approvalsReviewer: _staleApprovalsReviewer,
+    collaborationMode: _staleCollaborationMode,
+    ...withoutAuthoritativeControl
+  } = merged;
+  return {
+    ...withoutAuthoritativeControl,
+    state: incoming.state,
+    ...(incoming.model === undefined ? {} : { model: incoming.model }),
+    ...(incoming.reasoningEffort === undefined
+      ? {}
+      : { reasoningEffort: incoming.reasoningEffort }),
+    ...(incoming.serviceTier === undefined ? {} : { serviceTier: incoming.serviceTier }),
+    ...(incoming.permissionProfileId === undefined
+      ? {}
+      : { permissionProfileId: incoming.permissionProfileId }),
+    ...(incoming.approvalPolicy === undefined ? {} : { approvalPolicy: incoming.approvalPolicy }),
+    ...(incoming.approvalsReviewer === undefined
+      ? {}
+      : { approvalsReviewer: incoming.approvalsReviewer }),
+    ...(incoming.collaborationMode === undefined
+      ? {}
+      : { collaborationMode: incoming.collaborationMode }),
+    availableActions: incoming.availableActions,
+    ...(incoming.activeTurnId === undefined ? {} : { activeTurnId: incoming.activeTurnId }),
+  };
+}
+
+function incomingHydratesSummaryPlaceholder(
+  current: ThreadDetail,
+  incoming: ThreadDetail,
+): boolean {
+  const currentIsSummaryPlaceholder =
+    current.items.length === 0 &&
+    current.activeTurnId === undefined &&
+    !Object.values(current.availableActions).some(Boolean);
+  if (!currentIsSummaryPlaceholder) return false;
+
+  return (
+    incoming.items.length > 0 ||
+    incoming.activeTurnId !== undefined ||
+    Object.values(incoming.availableActions).some(Boolean)
+  );
+}
+
+function reconcileCreationSeedFirstUserMessage(
+  mergedItems: readonly ConversationItem[],
+  incoming: ThreadDetail,
+  creation: ThreadCreationMergeContext | undefined,
+): ConversationItem[] {
+  const creationSeed = creation?.creationSeed;
+  if (!creationSeed || creationSeed.id !== incoming.id) {
+    return [...mergedItems];
+  }
+  const seededFirstMessage = firstUserMessage(creationSeed.items);
+  const initialPrompt = creation.initialPrompt ?? seededFirstMessage?.text;
+  const persistedFirstMessage = firstUserMessage(incoming.items);
+  if (!initialPrompt || !persistedFirstMessage || persistedFirstMessage.text !== initialPrompt) {
+    return [...mergedItems];
+  }
+  const aliases = new Set(
+    [seededFirstMessage?.id, creation.liveAliasItemId].filter(
+      (id): id is string => id !== undefined && id !== persistedFirstMessage.id,
+    ),
+  );
+  return aliases.size === 0
+    ? [...mergedItems]
+    : mergedItems.filter(
+        (item) =>
+          !(item.kind === "user-message" && item.text === initialPrompt && aliases.has(item.id)),
+      );
+}
+
+export function findCreationPromptLiveAliasItemId(
+  events: readonly RemoteEvent[],
+  creation: ThreadCreationMergeContext | undefined,
+): string | undefined {
+  if (creation?.liveAliasItemId) return creation.liveAliasItemId;
+  const creationSeed = creation?.creationSeed;
+  const initialPrompt =
+    creation?.initialPrompt ?? firstUserMessage(creationSeed?.items ?? [])?.text;
+  if (!creationSeed?.activeTurnId || !initialPrompt) return undefined;
+
+  for (const event of events) {
+    if (
+      event.type !== "thread.item" ||
+      event.threadId !== creationSeed.id ||
+      event.turnId !== creationSeed.activeTurnId
+    ) {
+      continue;
+    }
+    const payloadItems = asRecord(event.payload).item;
+    if (!Array.isArray(payloadItems)) continue;
+    const alias = payloadItems
+      .map((item) => asRecord(item))
+      .find((item) => item.kind === "user-message" && item.text === initialPrompt);
+    if (typeof alias?.id === "string" && alias.id.length > 0) {
+      return alias.id;
+    }
+  }
+  return undefined;
+}
+
+export function persistedCreationPromptItemId(
+  thread: ThreadDetail,
+  initialPrompt: string | undefined,
+): string | undefined {
+  const first = firstUserMessage(thread.items);
+  return initialPrompt && first?.text === initialPrompt ? first.id : undefined;
+}
+
+export function reconcileLiveCreationPromptAlias(
+  thread: ThreadDetail,
+  creation: ThreadCreationMergeContext | undefined,
+  persistedItemId?: string,
+): ThreadDetail {
+  const aliasId = creation?.liveAliasItemId;
+  const seedMessage = firstUserMessage(creation?.creationSeed?.items ?? []);
+  const initialPrompt = creation?.initialPrompt ?? seedMessage?.text;
+  if (!aliasId || !initialPrompt) return thread;
+
+  const aliasExists = thread.items.some(
+    (item) => item.kind === "user-message" && item.id === aliasId && item.text === initialPrompt,
+  );
+  if (!aliasExists) return thread;
+
+  const dropId =
+    persistedItemId &&
+    persistedItemId !== aliasId &&
+    thread.items.some(
+      (item) =>
+        item.kind === "user-message" && item.id === persistedItemId && item.text === initialPrompt,
+    )
+      ? aliasId
+      : seedMessage?.id !== aliasId
+        ? seedMessage?.id
+        : undefined;
+  if (!dropId) return thread;
+  const items = thread.items.filter(
+    (item) => !(item.kind === "user-message" && item.id === dropId && item.text === initialPrompt),
+  );
+  return items.length === thread.items.length ? thread : { ...thread, items };
+}
+
+function mergeConversationItems(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+  preferIncoming: boolean,
+  reconcileTerminalTextAliases: boolean,
+  dropUnpersistedRunningTools: boolean,
+): ConversationItem[] {
+  const currentById = new Map(currentItems.map((item) => [item.id, item]));
+  const contextCompactionAliasIds = findContextCompactionAliasIds(persistedOrder, currentItems);
+  const optimisticUserAliases = findOptimisticUserAliases(persistedOrder, currentItems);
+  const liveUserRefreshAliases = findLiveUserRefreshAliases(persistedOrder, currentItems);
+  const userAliases = new Map([...optimisticUserAliases, ...liveUserRefreshAliases]);
+  const terminalTextAliasIds = reconcileTerminalTextAliases
+    ? findTerminalTextAliasIds(persistedOrder, currentItems)
+    : new Set<string>();
+  const seen = new Set<string>();
+  const merged: ConversationItem[] = [];
+
+  for (const incoming of persistedOrder) {
+    const current = currentById.get(incoming.id);
+    merged.push(mergeConversationItem(current, incoming, preferIncoming));
+    seen.add(incoming.id);
+  }
+  const retainedCurrentOnly = new Set<string>();
+  for (const item of currentItems) {
+    if (!seen.has(item.id)) {
+      if (
+        (dropUnpersistedRunningTools && item.kind === "tool" && item.status === "running") ||
+        contextCompactionAliasIds.has(item.id) ||
+        userAliases.has(item.id) ||
+        terminalTextAliasIds.has(item.id) ||
+        isCurrentTurnAssistantAlias(item, persistedOrder, currentItems)
+      ) {
+        continue;
+      }
+      retainedCurrentOnly.add(item.id);
+    }
+  }
+  return mergeCurrentOnlyItemsInStableOrder(merged, currentItems, retainedCurrentOnly, userAliases);
+}
+
+function mergeCurrentOnlyItemsInStableOrder(
+  persistedItems: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+  retainedCurrentOnly: ReadonlySet<string>,
+  aliasesToPersistedIds: ReadonlyMap<string, string> = new Map(),
+): ConversationItem[] {
+  if (retainedCurrentOnly.size === 0) {
+    return [...persistedItems];
+  }
+
+  const persistedIndexById = new Map(persistedItems.map((item, index) => [item.id, index]));
+  for (const [aliasId, persistedId] of aliasesToPersistedIds) {
+    const persistedIndex = persistedIndexById.get(persistedId);
+    if (persistedIndex !== undefined) persistedIndexById.set(aliasId, persistedIndex);
+  }
+  const gaps: Array<Array<{ currentIndex: number; item: ConversationItem; timestamp?: number }>> =
+    Array.from({ length: persistedItems.length + 1 }, () => []);
+
+  for (let currentIndex = 0; currentIndex < currentItems.length; currentIndex += 1) {
+    const item = currentItems[currentIndex];
+    if (!item || !retainedCurrentOnly.has(item.id)) continue;
+    const temporalGap = temporalInsertionGap(item, persistedItems);
+    const anchoredGap = anchoredInsertionGap(
+      currentIndex,
+      currentItems,
+      persistedIndexById,
+      persistedItems.length,
+    );
+    const gap = temporalGap ?? anchoredGap;
+    const timestamp = conversationItemTimestamp(item);
+    gaps[gap]?.push({
+      currentIndex,
+      item,
+      ...(timestamp === undefined ? {} : { timestamp }),
+    });
+  }
+
+  const result: ConversationItem[] = [];
+  for (let gapIndex = 0; gapIndex < gaps.length; gapIndex += 1) {
+    const gapItems = gaps[gapIndex] ?? [];
+    gapItems.sort((left, right) => {
+      if (
+        left.timestamp !== undefined &&
+        right.timestamp !== undefined &&
+        left.timestamp !== right.timestamp
+      ) {
+        return left.timestamp - right.timestamp;
+      }
+      return left.currentIndex - right.currentIndex;
+    });
+    result.push(...gapItems.map(({ item }) => item));
+    const persisted = persistedItems[gapIndex];
+    if (persisted) result.push(persisted);
+  }
+  return result;
+}
+
+function temporalInsertionGap(
+  item: ConversationItem,
+  persistedItems: readonly ConversationItem[],
+): number | undefined {
+  const timestamp = conversationItemTimestamp(item);
+  if (timestamp === undefined) return undefined;
+  for (let index = 0; index < persistedItems.length; index += 1) {
+    const persistedTimestamp = conversationItemTimestamp(persistedItems[index]);
+    if (persistedTimestamp !== undefined && persistedTimestamp > timestamp) {
+      return index;
+    }
+  }
+  return undefined;
+}
+
+function anchoredInsertionGap(
+  currentIndex: number,
+  currentItems: readonly ConversationItem[],
+  persistedIndexById: ReadonlyMap<string, number>,
+  persistedLength: number,
+): number {
+  let previousPersistedIndex: number | undefined;
+  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+    const candidate = currentItems[index];
+    if (!candidate) continue;
+    const persistedIndex = persistedIndexById.get(candidate.id);
+    if (persistedIndex !== undefined) {
+      previousPersistedIndex = persistedIndex;
+      break;
+    }
+  }
+
+  let nextPersistedIndex: number | undefined;
+  for (let index = currentIndex + 1; index < currentItems.length; index += 1) {
+    const candidate = currentItems[index];
+    if (!candidate) continue;
+    const persistedIndex = persistedIndexById.get(candidate.id);
+    if (persistedIndex !== undefined) {
+      nextPersistedIndex = persistedIndex;
+      break;
+    }
+  }
+
+  if (
+    nextPersistedIndex !== undefined &&
+    (previousPersistedIndex === undefined || previousPersistedIndex < nextPersistedIndex)
+  ) {
+    return nextPersistedIndex;
+  }
+  if (previousPersistedIndex !== undefined) {
+    return Math.min(persistedLength, previousPersistedIndex + 1);
+  }
+  return nextPersistedIndex ?? persistedLength;
+}
+
+function conversationItemTimestamp(item: ConversationItem | undefined): number | undefined {
+  if (!item) return undefined;
+  for (const value of [item.createdAt, item.turnStartedAt, item.turnCompletedAt]) {
+    if (!value) continue;
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return undefined;
+}
+
+function findOptimisticUserAliases(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const currentIds = new Set(currentItems.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(
+    (item): item is Extract<ConversationItem, { kind: "user-message" }> =>
+      item.kind === "user-message" && !currentIds.has(item.id),
+  );
+  for (const item of currentItems) {
+    if (
+      item.kind !== "user-message" ||
+      (!item.id.startsWith("pending-steer-") && !item.id.startsWith("pending-send-"))
+    ) {
+      continue;
+    }
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.text === item.text &&
+        conversationItemsMayShareTurn(item, persisted),
+    );
+    if (!match) continue;
+    aliases.set(item.id, match.id);
+    consumedPersistedIds.add(match.id);
+  }
+  return aliases;
+}
+
+function findLiveUserRefreshAliases(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const currentIds = new Set(currentItems.map((item) => item.id));
+  const persistedIds = new Set(persistedOrder.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(
+    (item): item is Extract<ConversationItem, { kind: "user-message" }> =>
+      item.kind === "user-message" && item.turnId !== undefined && !currentIds.has(item.id),
+  );
+
+  for (const item of currentItems) {
+    if (
+      item.kind !== "user-message" ||
+      item.turnId === undefined ||
+      persistedIds.has(item.id) ||
+      item.id.startsWith("pending-steer-") ||
+      item.id.startsWith("pending-send-")
+    ) {
+      continue;
+    }
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.turnId === item.turnId &&
+        persisted.text === item.text,
+    );
+    if (!match) continue;
+    aliases.set(item.id, match.id);
+    consumedPersistedIds.add(match.id);
+  }
+
+  return aliases;
+}
+
+function findTerminalTextAliasIds(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Set<string> {
+  const aliases = new Set<string>();
+  const persistedIds = new Set(persistedOrder.map((item) => item.id));
+  const consumedPersistedIds = new Set<string>();
+  const candidates = persistedOrder.filter(isTextItem);
+  for (const item of currentItems) {
+    if (
+      persistedIds.has(item.id) ||
+      !isTextItem(item) ||
+      (item.kind === "user-message" && item.id.startsWith("pending-steer-"))
+    ) {
+      continue;
+    }
+    const match = candidates.find(
+      (persisted) =>
+        !consumedPersistedIds.has(persisted.id) &&
+        persisted.kind === item.kind &&
+        persisted.text === item.text &&
+        conversationItemsMayShareTurn(item, persisted),
+    );
+    if (!match) continue;
+    aliases.add(item.id);
+    consumedPersistedIds.add(match.id);
+  }
+  return aliases;
+}
+
+function conversationItemsMayShareTurn(
+  left: Pick<ConversationItem, "turnId">,
+  right: Pick<ConversationItem, "turnId">,
+): boolean {
+  return left.turnId === undefined || right.turnId === undefined || left.turnId === right.turnId;
+}
+
+function findContextCompactionAliasIds(
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): Set<string> {
+  const aliases = new Set<string>();
+  const consumedPersisted = new Set<string>();
+  const persistedCompactions = persistedOrder.filter(isContextCompactionItem);
+  const currentCompactions = currentItems.filter(isContextCompactionItem);
+
+  for (const current of currentCompactions) {
+    if (persistedOrder.some((persisted) => persisted.id === current.id) || !current.createdAt) {
+      continue;
+    }
+    const currentTime = Date.parse(current.createdAt);
+    if (!Number.isFinite(currentTime)) continue;
+    const match = persistedCompactions.find((persisted) => {
+      if (
+        persisted.id === current.id ||
+        consumedPersisted.has(persisted.id) ||
+        !persisted.createdAt
+      ) {
+        return false;
+      }
+      const persistedTime = Date.parse(persisted.createdAt);
+      return Number.isFinite(persistedTime) && Math.abs(persistedTime - currentTime) <= 5_000;
+    });
+    if (match) {
+      aliases.add(current.id);
+      consumedPersisted.add(match.id);
+    }
+  }
+
+  const currentIds = new Set(currentItems.map((item) => item.id));
+  const persistedIds = new Set(persistedOrder.map((item) => item.id));
+  const unpairedPersisted = persistedCompactions.filter(
+    (item) => !currentIds.has(item.id) && !consumedPersisted.has(item.id),
+  );
+  const unpairedCurrent = currentCompactions.filter(
+    (item) =>
+      !persistedIds.has(item.id) &&
+      !aliases.has(item.id) &&
+      (item.createdAt === undefined || !Number.isFinite(Date.parse(item.createdAt))),
+  );
+  const pairCount = Math.min(unpairedPersisted.length, unpairedCurrent.length);
+  for (let offset = 1; offset <= pairCount; offset += 1) {
+    const alias = unpairedCurrent.at(-offset);
+    if (alias) aliases.add(alias.id);
+  }
+  return aliases;
+}
+
+function isContextCompactionItem(
+  item: ConversationItem,
+): item is Extract<ConversationItem, { kind: "tool" }> {
+  return item.kind === "tool" && item.operation === "context-compaction";
+}
+
+function isCurrentTurnAssistantAlias(
+  item: ConversationItem,
+  persistedOrder: readonly ConversationItem[],
+  currentItems: readonly ConversationItem[],
+): boolean {
+  if (
+    (item.kind !== "assistant-message" && item.kind !== "reasoning-summary") ||
+    persistedOrder.length === 0
+  ) {
+    return false;
+  }
+  const persistedUserIndex = persistedOrder.findLastIndex(
+    (candidate) => candidate.kind === "user-message",
+  );
+  if (persistedUserIndex < 0) return false;
+  const persistedUser = persistedOrder[persistedUserIndex];
+  const currentUserIndex = currentItems.findIndex(
+    (candidate) => candidate.id === persistedUser?.id && candidate.kind === "user-message",
+  );
+  const currentItemIndex = currentItems.findIndex((candidate) => candidate.id === item.id);
+  if (currentUserIndex < 0 || currentItemIndex <= currentUserIndex) return false;
+  return persistedOrder
+    .slice(persistedUserIndex + 1)
+    .some(
+      (candidate) =>
+        candidate.kind === item.kind && isTextItem(candidate) && candidate.text === item.text,
+    );
+}
+
+function isTextItem(item: ConversationItem): item is ConversationItem & {
+  kind: "user-message" | "assistant-message" | "reasoning-summary";
+  text: string;
+} {
+  return (
+    item.kind === "user-message" ||
+    item.kind === "assistant-message" ||
+    item.kind === "reasoning-summary"
+  );
+}
+
+function mergeConversationItem(
+  current: ConversationItem | undefined,
+  incoming: ConversationItem,
+  preferIncoming: boolean,
+): ConversationItem {
+  if (!current) return incoming;
+  if (current.kind === "tool" && incoming.kind === "tool") {
+    if (isTerminalToolStatus(current.status) && incoming.status === "running") return current;
+    if (current.status === "running" && isTerminalToolStatus(incoming.status)) return incoming;
+  }
+  if (current.kind === "user-message" && incoming.kind === "user-message") {
+    const selected = preferIncoming ? incoming : current;
+    const attachments = mergeConversationAttachments(current.attachments, incoming.attachments);
+    return attachments === undefined ? selected : { ...selected, attachments };
+  }
+  return preferIncoming ? incoming : current;
+}
+
+function mergeConversationAttachments(
+  current: readonly ConversationAttachment[] | undefined,
+  incoming: readonly ConversationAttachment[] | undefined,
+): ConversationAttachment[] | undefined {
+  const merged = new Map<string, ConversationAttachment>();
+  for (const attachment of [...(current ?? []), ...(incoming ?? [])]) {
+    merged.set(`${attachment.kind}\u0000${attachment.path}`, attachment);
+  }
+  return merged.size > 0 ? [...merged.values()] : undefined;
+}
+
+function incomingAdvancesToolLifecycle(
+  currentItems: readonly ConversationItem[],
+  incomingItems: readonly ConversationItem[],
+): boolean {
+  const currentById = new Map(currentItems.map((item) => [item.id, item]));
+  return incomingItems.some((incoming) => {
+    const current = currentById.get(incoming.id);
+    return (
+      current?.kind === "tool" &&
+      incoming.kind === "tool" &&
+      current.status === "running" &&
+      isTerminalToolStatus(incoming.status)
+    );
+  });
+}
+
+function incomingAdvancesThreadLifecycle(current: ThreadDetail, incoming: ThreadDetail): boolean {
+  if (
+    !isActiveThreadState(current.state) ||
+    !isTerminalThreadState(incoming.state) ||
+    incoming.activeTurnId !== undefined ||
+    !incoming.availableActions.reply
+  ) {
+    return false;
+  }
+
+  const incomingIds = new Set(incoming.items.map((item) => item.id));
+  const currentUserIndex = current.items.findLastIndex((item) => item.kind === "user-message");
+  const latestCurrentUser = current.items[currentUserIndex];
+  if (latestCurrentUser === undefined || !incomingIds.has(latestCurrentUser.id)) {
+    return false;
+  }
+  const currentIds = new Set(current.items.map((item) => item.id));
+  const incomingUserIndex = incoming.items.findIndex((item) => item.id === latestCurrentUser.id);
+  const coversCurrentTurnItem = current.items
+    .slice(currentUserIndex + 1)
+    .some((item) => incomingIds.has(item.id));
+  const addsPersistedCurrentTurnItem = incoming.items
+    .slice(incomingUserIndex + 1)
+    .some((item) => !currentIds.has(item.id));
+  return coversCurrentTurnItem || addsPersistedCurrentTurnItem;
+}
+
+function incomingCoversLatestUser(current: ThreadDetail, incoming: ThreadDetail): boolean {
+  const latestCurrentUser = current.items.findLast((item) => item.kind === "user-message");
+  if (latestCurrentUser?.kind !== "user-message") return false;
+  if (
+    incoming.items.some((item) => item.kind === "user-message" && item.id === latestCurrentUser.id)
+  ) {
+    return true;
+  }
+  const latestIncomingUser = incoming.items.findLast((item) => item.kind === "user-message");
+  return (
+    latestIncomingUser?.kind === "user-message" &&
+    latestIncomingUser.text === latestCurrentUser.text &&
+    current.items.some((item) => item.kind === "user-message" && item.id === latestIncomingUser.id)
+  );
+}
+
+function isActiveThreadState(state: ThreadDetail["state"]): boolean {
+  return state === "running" || state === "waiting-for-approval";
+}
+
+function isTerminalThreadState(state: ThreadDetail["state"]): boolean {
+  return state === "idle" || state === "complete" || state === "failed";
+}
+
+function isTerminalToolStatus(status: "running" | "complete" | "failed"): boolean {
+  return status === "complete" || status === "failed";
+}
+
+function compareUpdatedAt(left: string, right: string): number {
+  const leftTimestamp = Date.parse(left);
+  const rightTimestamp = Date.parse(right);
+  if (Number.isFinite(leftTimestamp) && Number.isFinite(rightTimestamp)) {
+    return leftTimestamp - rightTimestamp;
+  }
+  if (Number.isFinite(leftTimestamp)) return 1;
+  if (Number.isFinite(rightTimestamp)) return -1;
+  return left.localeCompare(right);
+}
+
+function sameItemSequence(
+  left: readonly ConversationItem[],
+  right: readonly ConversationItem[],
+): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function firstUserMessage(
+  items: readonly ConversationItem[],
+): (ConversationItem & { kind: "user-message"; text: string }) | undefined {
+  return items.find(
+    (item): item is ConversationItem & { kind: "user-message"; text: string } =>
+      item.kind === "user-message",
+  );
+}
+
+function isThreadDetail(value: unknown): value is ThreadDetail {
+  const candidate = asRecord(value);
+  const actions = asRecord(candidate.availableActions);
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.title === "string" &&
+    typeof candidate.updatedAt === "string" &&
+    typeof candidate.mode === "string" &&
+    threadModes.has(candidate.mode) &&
+    typeof candidate.state === "string" &&
+    runStates.has(candidate.state) &&
+    Array.isArray(candidate.items) &&
+    candidate.items.every(isConversationItem) &&
+    typeof actions.steer === "boolean" &&
+    typeof actions.interrupt === "boolean" &&
+    typeof actions.reply === "boolean" &&
+    typeof actions.changeModelNextTurn === "boolean"
+  );
+}
+
+function isConversationItem(value: unknown): value is ConversationItem {
+  const item = asRecord(value);
+  if (typeof item.id !== "string" || typeof item.kind !== "string") return false;
+  if (
+    item.kind === "user-message" ||
+    item.kind === "assistant-message" ||
+    item.kind === "reasoning-summary"
+  ) {
+    return (
+      typeof item.text === "string" &&
+      (item.kind !== "user-message" ||
+        item.attachments === undefined ||
+        (Array.isArray(item.attachments) &&
+          item.attachments.length <= 32 &&
+          item.attachments.every(isConversationAttachment)))
+    );
+  }
+  if (item.kind === "tool") {
+    return (
+      typeof item.title === "string" &&
+      (item.status === "running" || item.status === "complete" || item.status === "failed")
+    );
+  }
+  if (item.kind === "file-change") {
+    return (
+      typeof item.path === "string" &&
+      (item.change === "added" || item.change === "modified" || item.change === "deleted")
+    );
+  }
+  if (item.kind === "subagent-activity") {
+    return (
+      (item.action === "spawn" ||
+        item.action === "update" ||
+        item.action === "resume" ||
+        item.action === "wait" ||
+        item.action === "close" ||
+        item.action === "activity") &&
+      (item.status === "running" || item.status === "complete" || item.status === "failed") &&
+      Array.isArray(item.agents) &&
+      item.agents.length > 0 &&
+      item.agents.every((agent) => {
+        const candidate = asRecord(agent);
+        return (
+          typeof candidate.threadId === "string" &&
+          (candidate.label === undefined || typeof candidate.label === "string")
+        );
+      })
+    );
+  }
+  if (item.kind === "plan-progress") {
+    return (
+      Array.isArray(item.steps) &&
+      item.steps.length > 0 &&
+      item.steps.every((step) => {
+        const candidate = asRecord(step);
+        return (
+          typeof candidate.text === "string" &&
+          (candidate.status === "pending" ||
+            candidate.status === "inProgress" ||
+            candidate.status === "completed")
+        );
+      }) &&
+      (item.explanation === undefined || typeof item.explanation === "string")
+    );
+  }
+  return false;
+}
+
+function isConversationAttachment(value: unknown): value is ConversationAttachment {
+  const attachment = asRecord(value);
+  return (
+    (attachment.kind === "file" || attachment.kind === "image") &&
+    typeof attachment.name === "string" &&
+    attachment.name.length > 0 &&
+    attachment.name.length <= 255 &&
+    typeof attachment.path === "string" &&
+    attachment.path.length > 0 &&
+    attachment.path.length <= 32_768
+  );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}

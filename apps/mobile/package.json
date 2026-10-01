@@ -1,0 +1,23 @@
+{
+  "name": "@codex-local-remote/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "configure": "node scripts/configure.mjs",
+    "sync": "node scripts/prepare-config.mjs && vite build && cap sync",
+    "test": "node --test scripts/server-url.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@capacitor/core": "6.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/android": "6.2.0",
+    "@capacitor/cli": "6.2.0",
+    "@capacitor/ios": "6.2.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4"
+  }
+}

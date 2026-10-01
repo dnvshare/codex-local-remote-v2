@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#08111f" />
+    <title>Codex Local Remote</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="setup-card">
+      <div class="shell-header">
+        <p class="eyebrow">
+          <span data-i18n="eyebrow">独立手机版</span>
+          <span class="title-separator" aria-hidden="true">·</span>
+          <span class="build-version">v1.6</span>
+          <span class="title-separator" aria-hidden="true">·</span>
+          <time id="current-time" class="current-time" aria-label="当前时间">--:--:--</time>
+        </p>
+        <div class="shell-actions">
+          <button
+            class="stop-connect-button"
+            id="stop-auto-connect"
+            data-i18n="stopAutoConnect"
+            type="button"
+            aria-label="停止自动连接"
+            hidden
+          >
+            停止自动连接
+          </button>
+          <button class="language-toggle" id="toggle-language" type="button" aria-label="切换到英文">
+            EN
+          </button>
+        </div>
+      </div>
+      <h1 data-i18n="title">连接到你的电脑</h1>
+      <p data-i18n="description">
+        填写 Sidecar 的完整访问地址。保存后立即连接，下次启动会自动使用这个地址。
+      </p>
+      <form id="connection-form" novalidate>
+        <label for="server-url" data-i18n="addressLabel">连接地址</label>
+        <input
+          id="server-url"
+          name="server-url"
+          inputmode="url"
+          autocomplete="url"
+          autocapitalize="none"
+          spellcheck="false"
+          data-i18n-placeholder
+          placeholder="https://主机/codex-remote/"
+          required
+          type="text"
+        />
+        <p id="connection-status" class="form-status" role="status" aria-live="polite">
+          <span data-i18n="loadingStatus">正在载入操作功能…</span>
+        </p>
+        <p id="connection-error" class="form-error" hidden role="alert"></p>
+        <button class="primary-button" id="save-connection" data-i18n="save" type="submit">
+          保存并连接
+        </button>
+        <button class="secondary-button" id="clear-connection" data-i18n="clear" type="button">
+          清除已保存地址
+        </button>
+      </form>
+      <p class="note" data-i18n="note">HTTP 仅限本机和局域网地址。公网连接请使用 HTTPS。</p>
+    </main>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>

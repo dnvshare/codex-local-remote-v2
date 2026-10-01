@@ -1,0 +1,24 @@
+{
+  "Signature": "codex-local-remote-v2/remote-settings/v1",
+  "Version": 1,
+  "ListenMode": "lan",
+  "SecurityMode": "https",
+  "SidecarPort": 28790,
+  "BrokerPort": 28791,
+  "UpstreamPort": 28792,
+  "BasePath": "/codex-remote",
+  "SessionCookieName": "codex_remote_session_instance",
+  "DesktopSyncEnabled": true,
+  "AllowedOrigins": [],
+  "TrustedProxyAddresses": [],
+  "TrustedProxyNetworks": [],
+  "Auth": {
+    "MinimumPasswordLength": 15,
+    "SessionIdleHours": 24,
+    "SessionAbsoluteDays": 7,
+    "LoginMaxAttempts": 5,
+    "GlobalLoginMaxAttempts": 50,
+    "LoginWindowMinutes": 10,
+    "LoginLockoutMinutes": 15
+  }
+}

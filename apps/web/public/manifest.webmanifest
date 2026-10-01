@@ -1,0 +1,36 @@
+{
+  "name": "Codex Local Remote",
+  "short_name": "Local Remote",
+  "description": "远程控制 ChatGPT / Codex Desktop 任务，并管理当前 Windows 身份可访问的电脑文件。",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "background_color": "#ffffff",
+  "theme_color": "#0b6b3a",
+  "orientation": "any",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

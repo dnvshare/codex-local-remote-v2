@@ -1,0 +1,5 @@
+"CFBundleDisplayName" = "Codex Local Remote";
+"CFBundleName" = "Codex Local Remote";
+"NSLocalNetworkUsageDescription" = "Connect to your Codex Local Remote Sidecar on the local network.";
+"NSMicrophoneUsageDescription" = "Use the microphone to convert your speech into text in the message composer.";
+"NSSpeechRecognitionUsageDescription" = "Convert your speech into text for the message composer.";

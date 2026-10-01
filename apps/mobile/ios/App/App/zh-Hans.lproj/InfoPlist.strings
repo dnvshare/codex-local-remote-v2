@@ -1,0 +1,5 @@
+"CFBundleDisplayName" = "Codex 远程控制";
+"CFBundleName" = "Codex 远程控制";
+"NSLocalNetworkUsageDescription" = "用于连接局域网中的 Codex Local Remote 服务。";
+"NSMicrophoneUsageDescription" = "用于在消息输入框中将你的语音转换为文字。";
+"NSSpeechRecognitionUsageDescription" = "用于将你的语音识别为消息输入文字。";

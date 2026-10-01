@@ -1,0 +1,5795 @@
+import { createHash } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { PERSISTED_CONVERSATION_CURSOR_PREFIX } from "@codex-local-remote/contracts";
+import type {
+  AccountTokenUsageSummary,
+  ApprovalPolicyOption,
+  ApprovalReviewerOption,
+  CollaborationModeOption,
+  ConversationItem,
+  CreateThreadInput,
+  DailyTokenUsage,
+  LocalInputReference,
+  ModelOption,
+  PermissionMode,
+  PermissionProfileOption,
+  PersistedConversationHistoryScope,
+  PersistedConversationReadResult,
+  ProjectSummary,
+  ReasoningEffort,
+  SetThreadGoalInput,
+  SendTurnInput,
+  SteerTurnInput,
+  SubagentHistoryIntegrity,
+  SubagentSummary,
+  ThreadDetail,
+  ThreadGoal,
+  ThreadGoalStatus,
+  ThreadSettingsInput,
+  ThreadSummary,
+  UsageCredits,
+  UsageSnapshot,
+  UsageWindow,
+} from "@codex-local-remote/contracts";
+import { validateSafeWindowsProjectRoot } from "@codex-local-remote/security";
+
+import type { RemoteEventBuffer } from "./events.js";
+import {
+  projectAppServerNotification,
+  projectThreadDetail,
+  projectThreadSummary,
+  type AppServerNotificationLike,
+} from "./projection.js";
+
+const SUBAGENT_CURSOR_PREFIX = "clr-subagents-v1.";
+const MAX_PINNED_THREAD_SUPPLEMENTS = 100;
+const PINNED_THREAD_READ_CONCURRENCY = 8;
+const DESKTOP_RECONCILIATION_BATCH_SIZE = 32;
+const LOADED_THREAD_BACKFILL_BATCH_SIZE = 32;
+const MAX_LOADED_THREAD_PAGES = 20;
+const MAX_ARCHIVE_RECONCILIATION_PAGES = 20;
+const MAX_SUBAGENT_ANCESTOR_READS = 500;
+const SUBAGENT_ANCESTOR_READ_CONCURRENCY = 8;
+const MAX_THREAD_NAME_LENGTH = 200;
+const ARCHIVE_CLEANUP_RETRY_DELAYS_MS = [0, 25, 100] as const;
+const SHARED_THREAD_RESUME_DELAYS_MS = [0, 25, 100, 250, 500, 1_000] as const;
+const SHARED_INVENTORY_FAST_PATH_MS = 250;
+// Keep whole-thread reads comfortably below the Broker's 16 MiB frame limit.
+const MAX_APP_SERVER_HISTORY_SESSION_BYTES = 8 * 1024 * 1024;
+
+export interface AppServerGateway {
+  request<T = unknown>(method: string, params?: unknown): Promise<T>;
+}
+
+export interface RegisteredProject {
+  id: string;
+  name: string;
+  root: string;
+  source?: ProjectSummary["source"];
+}
+
+export interface ServiceDegradation {
+  code: "feature-unavailable" | "temporarily-unavailable";
+  feature:
+    | "approval-reviewer"
+    | "approval-policy"
+    | "collaboration-mode"
+    | "usage"
+    | "permissions"
+    | "history"
+    | "models";
+  message: string;
+}
+
+export interface ServiceResult<T> {
+  data: T;
+  degradations: ServiceDegradation[];
+}
+
+export interface ThreadPage {
+  data: ThreadSummary[];
+  nextCursor?: string;
+}
+
+export interface TurnCommandResult {
+  threadId: string;
+  turnId: string;
+  state: "running" | "idle";
+}
+
+export interface ResolvedLocalInputReference {
+  kind: "file" | "directory";
+  name: string;
+  path: string;
+}
+
+export interface SubagentPage {
+  data: SubagentSummary[];
+  nextCursor?: string;
+  historyIntegrity?: SubagentHistoryIntegrity;
+}
+
+interface SubagentCursorState {
+  archived?: string;
+  current?: string;
+}
+
+type SubagentStreamStatus = SubagentHistoryIntegrity["streams"]["current"]["status"];
+
+interface SubagentStreamCollection {
+  nextCursor?: string;
+  requestedLimit: number;
+  status: SubagentStreamStatus;
+  threads: Record<string, unknown>[];
+}
+
+interface SubagentSnapshotDiscovery {
+  labels: Map<string, string>;
+  threads: Record<string, unknown>[];
+  referencedThreadIds: Set<string>;
+  readCount: number;
+  readDiagnosticMissing: boolean;
+  readFailureCount: number;
+  historyIncomplete: boolean;
+  traversalTruncated: boolean;
+}
+
+interface ThreadHistoryReadDiagnostic {
+  observedCount: number;
+  status: "exhausted" | "more-available";
+}
+
+export interface PersistedThreadHead {
+  activeTurnId?: string;
+  controlState?: "active" | "idle" | "unknown";
+  sourceBytes: number;
+}
+
+export class DomainError extends Error {
+  readonly code:
+    | "INVALID_INPUT"
+    | "PROJECT_NOT_AUTHORIZED"
+    | "PROJECT_NOT_FOUND"
+    | "PROJECT_PATH_INVALID"
+    | "PROJECT_DIRECTORY_INVALID"
+    | "PROJECT_DIRECTORY_ACCESS_DENIED"
+    | "PROJECT_DIRECTORY_NOT_FOUND"
+    | "PROJECT_DIRECTORY_UNAVAILABLE"
+    | "FEATURE_UNAVAILABLE"
+    | "THREAD_NOT_FOUND"
+    | "THREAD_READ_ONLY"
+    | "DIRECT_INPUT_UNAVAILABLE"
+    | "TURN_CONTROL_LOST"
+    | "TURN_MISMATCH";
+  readonly httpStatus: number;
+
+  constructor(code: DomainError["code"], message: string, httpStatus: number) {
+    super(message);
+    this.name = "DomainError";
+    this.code = code;
+    this.httpStatus = httpStatus;
+  }
+}
+
+export class ProjectRegistry {
+  readonly #projects = new Map<string, Required<RegisteredProject>>();
+
+  constructor(projects: RegisteredProject[] = []) {
+    for (const project of projects) {
+      this.register(project);
+    }
+  }
+
+  register(project: RegisteredProject): void {
+    const id = project.id.trim();
+    const name = project.name.trim();
+    const rootValidation = validateSafeWindowsProjectRoot(project.root);
+    if (!id || !name || !rootValidation.ok) {
+      throw new DomainError("INVALID_INPUT", "Project configuration is invalid", 400);
+    }
+    const root = rootValidation.normalized;
+    const rootKey = windowsPathKey(root);
+    const existing = [...this.#projects.values()].find(
+      (candidate) => candidate.id !== id && windowsPathKey(candidate.root) === rootKey,
+    );
+    if (existing) {
+      if (existing.source === "registered" || project.source !== "registered") {
+        return;
+      }
+      this.#projects.delete(existing.id);
+    }
+    this.#projects.set(id, {
+      id,
+      name,
+      root,
+      source: project.source ?? "registered",
+    });
+  }
+
+  list(): ProjectSummary[] {
+    return [...this.#projects.values()]
+      .map((project) => ({
+        id: project.id,
+        name: project.name,
+        rootLabel: path.win32.basename(project.root),
+        source: project.source,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
+  }
+
+  requireRoot(projectId: string): string {
+    const project = this.#projects.get(projectId);
+    if (!project) {
+      throw new DomainError("PROJECT_NOT_FOUND", "Project not found", 404);
+    }
+    return project.root;
+  }
+
+  requireRegisteredRoot(projectId: string): string {
+    const project = this.#projects.get(projectId);
+    if (!project) {
+      throw new DomainError("PROJECT_NOT_FOUND", "Project not found", 404);
+    }
+    if (project.source !== "registered") {
+      throw new DomainError(
+        "PROJECT_NOT_AUTHORIZED",
+        "This project is not registered on the local computer; only existing conversations can be viewed",
+        403,
+      );
+    }
+    return project.root;
+  }
+
+  findIdByCwd(cwd: unknown): string | undefined {
+    const normalized = windowsPathKey(cwd);
+    if (normalized === undefined) {
+      return undefined;
+    }
+    const matches = [...this.#projects.values()].filter(
+      (project) => windowsPathKey(project.root) === normalized,
+    );
+    return matches.find((project) => project.source === "registered")?.id ?? matches[0]?.id;
+  }
+}
+
+export interface CodexDomainServiceOptions {
+  archiveCleanupRetryDelaysMs?: number[];
+  archiveIntents?: Iterable<ArchiveIntent>;
+  beginArchiveIntent?: (threadId: string, targetArchived: boolean) => Promise<ArchiveIntent>;
+  clearPendingDesktopNotification?: (threadId: string) => Promise<void>;
+  events?: RemoteEventBuffer;
+  gateway: AppServerGateway;
+  generalConversationRoot?: string;
+  listPinnedThreadIds?: () => Promise<readonly string[] | undefined>;
+  managedThreadIds?: Iterable<string>;
+  notifyManagedThreadCreated?: (threadId: string) => void | Promise<void>;
+  pendingDesktopNotificationThreadIds?: Iterable<string>;
+  protocolCatalog?: {
+    approvalPolicies?: readonly string[];
+    approvalReviewers?: readonly string[];
+    clientMethods?: readonly string[];
+  };
+  readPersistedUsageContext?: (
+    threadId: string,
+    sessionPath?: string,
+  ) => Promise<NonNullable<UsageSnapshot["context"]> | undefined>;
+  readPersistedConversationItems?: (
+    threadId: string,
+    sessionPath?: string,
+    scope?: PersistedConversationHistoryScope,
+    historyCursor?: string,
+  ) => Promise<ConversationItem[] | PersistedConversationReadResult>;
+  readPersistedRuntimeSettings?: (
+    threadId: string,
+    sessionPath?: string,
+  ) => Promise<ThreadSettingsInput | undefined>;
+  readPersistedThreadHead?: (
+    threadId: string,
+    sessionPath?: string,
+  ) => Promise<PersistedThreadHead | undefined>;
+  persistManagedThread?: (
+    threadId: string,
+    options: { desktopNotificationPending: boolean },
+  ) => Promise<void>;
+  unpersistManagedThread?: (threadId: string) => Promise<void>;
+  projects: ProjectRegistry;
+  persistRegisteredProject?: (project: RegisteredProject) => Promise<void>;
+  resolveLocalInputReference?: (
+    reference: LocalInputReference,
+  ) => Promise<ResolvedLocalInputReference>;
+  resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined>;
+  refreshRegisteredProjects?: () => Promise<void>;
+  sharedAppServer?: boolean;
+  sharedResumeDelaysMs?: number[];
+  settleArchiveIntent?: (threadId: string, observedArchived: boolean) => Promise<void>;
+}
+
+export interface ArchiveIntent {
+  desktopNotificationPending: boolean;
+  managed: boolean;
+  targetArchived: boolean;
+  threadId: string;
+}
+
+interface CompactionRuntimeState {
+  itemId?: string;
+  phase: "observed" | "reserving" | "requested";
+  turnId?: string;
+}
+
+interface ThreadRuntimeSettingsState {
+  model?: string | null;
+  reasoningEffort?: ReasoningEffort | null;
+  serviceTier?: string | null;
+  permissionProfileId?: string | null;
+  approvalPolicy?: string | null;
+  approvalsReviewer?: string | null;
+  collaborationMode?: string | null;
+}
+
+export class CodexDomainService {
+  readonly #archiveCleanupAttempts = new Map<string, Promise<void>>();
+  readonly #archiveCleanupRetryDelaysMs: readonly number[];
+  readonly #archiveIntents = new Map<string, ArchiveIntent>();
+  readonly #archiveMutationTails = new Map<string, Promise<void>>();
+  readonly #beginArchiveIntent:
+    | ((threadId: string, targetArchived: boolean) => Promise<ArchiveIntent>)
+    | undefined;
+  readonly #clearPendingDesktopNotification: ((threadId: string) => Promise<void>) | undefined;
+  readonly #activeThreadIds = new Set<string>();
+  readonly #archivedThreadIds = new Set<string>();
+  readonly #desktopNotificationAttempts = new Map<string, Promise<void>>();
+  readonly #events: RemoteEventBuffer | undefined;
+  readonly #gateway: AppServerGateway;
+  readonly #generalConversationRoot: string | undefined;
+  readonly #listPinnedThreadIds: (() => Promise<readonly string[] | undefined>) | undefined;
+  readonly #loadedThreadIds = new Set<string>();
+  readonly #managedThreads = new Set<string>();
+  readonly #notifyManagedThreadCreated: ((threadId: string) => void | Promise<void>) | undefined;
+  readonly #persistManagedThread:
+    | ((threadId: string, options: { desktopNotificationPending: boolean }) => Promise<void>)
+    | undefined;
+  readonly #persistRegisteredProject: ((project: RegisteredProject) => Promise<void>) | undefined;
+  readonly #unpersistManagedThread: ((threadId: string) => Promise<void>) | undefined;
+  readonly #recentlyCompletedCompactionTurns = new Map<string, string>();
+  readonly #resolveLocalInputReference:
+    | ((reference: LocalInputReference) => Promise<ResolvedLocalInputReference>)
+    | undefined;
+  readonly #resolveRegisteredProjectRoot: (projectId: string) => Promise<string | undefined>;
+  readonly #refreshRegisteredProjects: (() => Promise<void>) | undefined;
+  readonly #sharedAppServer: boolean;
+  readonly #sharedResumeDelaysMs: readonly number[];
+  readonly #settleArchiveIntent:
+    | ((threadId: string, observedArchived: boolean) => Promise<void>)
+    | undefined;
+  readonly #sharedThreadSnapshots = new Map<string, Record<string, unknown>>();
+  readonly #sharedSubscribedThreads = new Set<string>();
+  readonly #sharedSubscriptionPromises = new Map<string, Promise<void>>();
+  readonly #publishedThreadSnapshotSignatures = new Map<string, string>();
+  readonly #reconciledCurrentThreadIds = new Set<string>();
+  readonly #restoredPendingDesktopNotifications = new Set<string>();
+  readonly #restoredThreadsNeedingRefresh = new Set<string>();
+  readonly #activeTurns = new Map<string, string>();
+  readonly #compactingThreads = new Map<string, CompactionRuntimeState>();
+  readonly #directInputThreads = new Set<string>();
+  readonly #orphanedActiveTurns = new Set<string>();
+  readonly #pendingTurnStarts = new Set<string>();
+  readonly #pinnedThreadRanks = new Map<string, number>();
+  readonly #protocolApprovalPolicies: readonly string[];
+  readonly #protocolApprovalReviewers: readonly string[];
+  readonly #protocolClientMethods: ReadonlySet<string>;
+  readonly #readPersistedUsageContext:
+    | ((
+        threadId: string,
+        sessionPath?: string,
+      ) => Promise<NonNullable<UsageSnapshot["context"]> | undefined>)
+    | undefined;
+  readonly #readPersistedConversationItems:
+    | ((
+        threadId: string,
+        sessionPath?: string,
+        scope?: PersistedConversationHistoryScope,
+        historyCursor?: string,
+      ) => Promise<ConversationItem[] | PersistedConversationReadResult>)
+    | undefined;
+  readonly #readPersistedRuntimeSettings:
+    | ((threadId: string, sessionPath?: string) => Promise<ThreadSettingsInput | undefined>)
+    | undefined;
+  readonly #readPersistedThreadHead:
+    | ((threadId: string, sessionPath?: string) => Promise<PersistedThreadHead | undefined>)
+    | undefined;
+  readonly #threadsAwaitingInitialTurnCompletion = new Set<string>();
+  readonly #turnStartsCompletedBeforeResponse = new Map<string, Set<string>>();
+  readonly #turnStartTerminalStatusesBeforeResponse = new Map<
+    string,
+    { status: unknown; turnId: string }
+  >();
+  #desktopReconciliationPromise: Promise<void> | undefined;
+  #projectRefreshPromise: Promise<void> | undefined;
+  #sharedInventoryComplete = false;
+  #sharedInventoryRefreshPromise: Promise<void> | undefined;
+  readonly #pendingRuntimeSettings = new Map<string, ThreadRuntimeSettingsState>();
+  readonly #threadRuntimeSettings = new Map<string, ThreadRuntimeSettingsState>();
+  readonly #usageContexts = new Map<string, NonNullable<UsageSnapshot["context"]>>();
+  #managedArchiveCensusPending = true;
+  #historyTruncated = false;
+  readonly projects: ProjectRegistry;
+
+  constructor(options: CodexDomainServiceOptions) {
+    const archiveCleanupRetryDelaysMs = (options.archiveCleanupRetryDelaysMs ?? []).filter(
+      (value) => Number.isFinite(value) && value >= 0,
+    );
+    this.#archiveCleanupRetryDelaysMs =
+      archiveCleanupRetryDelaysMs.length > 0
+        ? archiveCleanupRetryDelaysMs
+        : ARCHIVE_CLEANUP_RETRY_DELAYS_MS;
+    this.#beginArchiveIntent = options.beginArchiveIntent;
+    this.#clearPendingDesktopNotification = options.clearPendingDesktopNotification;
+    this.#events = options.events;
+    this.#gateway = options.gateway;
+    this.#listPinnedThreadIds = options.listPinnedThreadIds;
+    if (options.generalConversationRoot === undefined) {
+      this.#generalConversationRoot = undefined;
+    } else {
+      const generalRoot = validateSafeWindowsProjectRoot(options.generalConversationRoot);
+      if (!generalRoot.ok) {
+        throw new DomainError(
+          "INVALID_INPUT",
+          "The projectless conversation directory configuration is invalid",
+          400,
+        );
+      }
+      this.#generalConversationRoot = generalRoot.normalized;
+    }
+    this.#notifyManagedThreadCreated = options.notifyManagedThreadCreated;
+    this.#persistManagedThread = options.persistManagedThread;
+    this.#persistRegisteredProject = options.persistRegisteredProject;
+    this.#unpersistManagedThread = options.unpersistManagedThread;
+    this.#protocolApprovalPolicies = sanitizeProtocolOptions(
+      options.protocolCatalog?.approvalPolicies,
+    );
+    this.#protocolApprovalReviewers = sanitizeProtocolOptions(
+      options.protocolCatalog?.approvalReviewers,
+    );
+    this.#protocolClientMethods = new Set(
+      sanitizeProtocolOptions(options.protocolCatalog?.clientMethods),
+    );
+    this.#readPersistedUsageContext = options.readPersistedUsageContext;
+    this.#readPersistedConversationItems = options.readPersistedConversationItems;
+    this.#readPersistedRuntimeSettings = options.readPersistedRuntimeSettings;
+    this.#readPersistedThreadHead = options.readPersistedThreadHead;
+    this.#resolveLocalInputReference = options.resolveLocalInputReference;
+    this.#resolveRegisteredProjectRoot = options.resolveRegisteredProjectRoot;
+    this.#refreshRegisteredProjects = options.refreshRegisteredProjects;
+    this.#sharedAppServer = options.sharedAppServer === true;
+    this.#sharedResumeDelaysMs = options.sharedResumeDelaysMs ?? SHARED_THREAD_RESUME_DELAYS_MS;
+    this.#settleArchiveIntent = options.settleArchiveIntent;
+    for (const intent of options.archiveIntents ?? []) {
+      const normalized = normalizeArchiveIntent(intent);
+      if (normalized !== undefined) {
+        this.#archiveIntents.set(normalized.threadId, normalized);
+      }
+    }
+    for (const threadId of options.managedThreadIds ?? []) {
+      const normalized = threadId.trim();
+      if (normalized) {
+        this.#managedThreads.add(normalized);
+        this.#restoredThreadsNeedingRefresh.add(normalized);
+      }
+    }
+    for (const threadId of options.pendingDesktopNotificationThreadIds ?? []) {
+      const normalized = threadId.trim();
+      if (this.#managedThreads.has(normalized)) {
+        this.#threadsAwaitingInitialTurnCompletion.add(normalized);
+        this.#restoredPendingDesktopNotifications.add(normalized);
+      }
+    }
+    this.projects = options.projects;
+  }
+
+  listProjects(): Promise<ProjectSummary[]> {
+    return Promise.resolve(this.projects.list());
+  }
+
+  async registerThreadProject(threadId: string): Promise<ProjectSummary> {
+    const normalizedThreadId = threadId.trim();
+    if (!normalizedThreadId) {
+      throw new DomainError("INVALID_INPUT", "Thread identifier is invalid", 400);
+    }
+    const thread = asRecord(
+      asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: false,
+          threadId: normalizedThreadId,
+        }),
+      ).thread,
+    );
+    if (asString(thread.id) !== normalizedThreadId) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    if (asString(thread.parentThreadId) !== undefined) {
+      throw new DomainError(
+        "THREAD_READ_ONLY",
+        "Subtasks are managed by their parent task and cannot register a project independently",
+        409,
+      );
+    }
+    const project = await safeThreadProject(thread.cwd, true);
+    if (project === undefined || this.#isGeneralConversationRoot(project.root)) {
+      throw new DomainError(
+        "PROJECT_NOT_AUTHORIZED",
+        "This conversation has no project directory available for registration",
+        403,
+      );
+    }
+    await this.#refreshProjectRegistry();
+    const existingId = this.projects.findIdByCwd(project.root);
+    if (existingId !== undefined) {
+      // Explicit registration must refresh the persisted directory identity,
+      // including when a network project already has a registration record.
+      project.id = existingId;
+    }
+    const registered: RegisteredProject = { ...project, source: "registered" };
+    if (this.#persistRegisteredProject === undefined) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current service cannot register a project",
+        503,
+      );
+    }
+    await this.#persistRegisteredProject(registered);
+    this.projects.register(registered);
+    const result = this.projects.list().find((candidate) => candidate.id === registered.id);
+    if (result === undefined) {
+      throw new DomainError("FEATURE_UNAVAILABLE", "Project registration did not complete", 503);
+    }
+    return result;
+  }
+
+  async #discoverThreadProjects(threads: readonly Record<string, unknown>[]): Promise<void> {
+    const candidateCwds = new Map<string, string>();
+    for (const thread of threads) {
+      const cwd = asString(thread.cwd);
+      if (
+        cwd === undefined ||
+        asString(thread.parentThreadId) !== undefined ||
+        this.projects.findIdByCwd(cwd) ||
+        this.#isGeneralConversationRoot(cwd)
+      ) {
+        continue;
+      }
+      const cwdKey = windowsPathKey(cwd);
+      if (cwdKey !== undefined) {
+        candidateCwds.set(cwdKey, cwd);
+      }
+    }
+    const discovered = await Promise.all(
+      [...candidateCwds.values()].map(async (cwd) => await safeThreadProject(cwd)),
+    );
+    for (const project of discovered) {
+      if (
+        project !== undefined &&
+        !this.#isGeneralConversationRoot(project.root) &&
+        !this.projects.findIdByCwd(project.root)
+      ) {
+        this.projects.register(project);
+      }
+    }
+  }
+
+  async #ensureThreadProjectDiscovered(thread: Record<string, unknown>): Promise<void> {
+    if (
+      this.#isGeneralConversationRoot(thread.cwd) ||
+      this.projects.findIdByCwd(thread.cwd) !== undefined
+    ) {
+      return;
+    }
+    await this.#discoverThreadProjects([thread]);
+  }
+
+  async #refreshProjectRegistry(): Promise<void> {
+    const refresh = this.#refreshRegisteredProjects;
+    if (refresh === undefined) {
+      return;
+    }
+    const existing = this.#projectRefreshPromise;
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+    const refreshPromise = (async () => {
+      try {
+        await refresh();
+      } catch {
+        // Keep the last validated registry if the state file is temporarily
+        // unavailable. Authorization still rechecks the selected project.
+      }
+    })();
+    this.#projectRefreshPromise = refreshPromise;
+    try {
+      await refreshPromise;
+    } finally {
+      if (this.#projectRefreshPromise === refreshPromise) {
+        this.#projectRefreshPromise = undefined;
+      }
+    }
+  }
+
+  async listModels(): Promise<ServiceResult<ModelOption[]>> {
+    const rawModels: Record<string, unknown>[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let truncated = false;
+    for (let page = 0; page < 20; page += 1) {
+      const response = asRecord(
+        await this.#gateway.request("model/list", {
+          ...(cursor === undefined ? {} : { cursor }),
+          includeHidden: false,
+          limit: 100,
+        }),
+      );
+      rawModels.push(...asRecordArray(response.data));
+      const nextCursor = asString(response.nextCursor);
+      if (!nextCursor) {
+        break;
+      }
+      if (seenCursors.has(nextCursor)) {
+        truncated = true;
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+      if (page === 19) {
+        truncated = true;
+      }
+    }
+    const models = rawModels
+      .filter((model) => model.hidden !== true)
+      .map((model) => {
+        const description = asString(model.description);
+        const defaultReasoningEffort = asReasoningEffort(model.defaultReasoningEffort);
+        const defaultServiceTier = asString(model.defaultServiceTier);
+        const serviceTiers = asRecordArray(model.serviceTiers)
+          .map((tier) => {
+            const id = asString(tier.id);
+            const displayName = asString(tier.name);
+            const tierDescription = asString(tier.description);
+            if (!id || !displayName) {
+              return undefined;
+            }
+            return {
+              displayName,
+              id,
+              ...(tierDescription === undefined ? {} : { description: tierDescription }),
+            };
+          })
+          .filter((tier): tier is NonNullable<typeof tier> => tier !== undefined);
+        return {
+          id: asString(model.model) ?? asString(model.id) ?? "",
+          displayName:
+            asString(model.displayName) ??
+            asString(model.model) ??
+            asString(model.id) ??
+            "Available models",
+          supportedReasoningEfforts: asRecordArray(model.supportedReasoningEfforts)
+            .map((option) => asReasoningEffort(option.reasoningEffort))
+            .filter((effort): effort is ReasoningEffort => effort !== undefined),
+          isDefault: model.isDefault === true,
+          ...(description === undefined ? {} : { description }),
+          ...(defaultReasoningEffort === undefined ? {} : { defaultReasoningEffort }),
+          ...(serviceTiers.length === 0 ? {} : { serviceTiers }),
+          ...(defaultServiceTier === undefined ? {} : { defaultServiceTier }),
+        };
+      })
+      .filter((model) => model.id.length > 0);
+    const unique = [...new Map(models.map((model) => [model.id, model])).values()];
+    return {
+      data: unique,
+      degradations: truncated
+        ? [
+            {
+              code: "temporarily-unavailable",
+              feature: "models",
+              message:
+                "There are many available models; the current list could not be loaded completely.",
+            },
+          ]
+        : [],
+    };
+  }
+
+  async listPermissionProfiles(
+    options: { projectId?: string; threadId?: string } = {},
+  ): Promise<ServiceResult<PermissionProfileOption[]>> {
+    try {
+      let cwd: string | undefined;
+      if (options.threadId !== undefined) {
+        requireNonEmpty(options.threadId, "thread id");
+        if (this.#managedThreads.has(options.threadId)) {
+          await this.#ensureSharedThread(options.threadId);
+        }
+        if (this.#sharedAppServer) {
+          cwd = asString(this.#requireSharedThreadMetadata(options.threadId).cwd);
+        } else {
+          const response = asRecord(
+            await this.#gateway.request("thread/read", {
+              includeTurns: false,
+              threadId: options.threadId,
+            }),
+          );
+          cwd = asString(asRecord(response.thread).cwd);
+        }
+      } else if (options.projectId !== undefined) {
+        cwd = await this.#requireAuthorizedProjectRoot(options.projectId);
+      } else {
+        cwd = this.#generalConversationRoot;
+      }
+      if (!cwd) {
+        throw new Error("permission profile cwd unavailable");
+      }
+
+      const data: PermissionProfileOption[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 20; page += 1) {
+        const response = asRecord(
+          await this.#gateway.request("permissionProfile/list", {
+            ...(cursor === undefined ? {} : { cursor }),
+            cwd,
+            limit: 100,
+          }),
+        );
+        for (const profile of asRecordArray(response.data)) {
+          const id = asString(profile.id);
+          if (!id || typeof profile.allowed !== "boolean") {
+            continue;
+          }
+          const description = asString(profile.description);
+          data.push({
+            allowed: profile.allowed,
+            id,
+            ...(description === undefined ? {} : { description }),
+          });
+        }
+        const nextCursor = asString(response.nextCursor);
+        if (!nextCursor || nextCursor === cursor) {
+          break;
+        }
+        cursor = nextCursor;
+      }
+      return {
+        data: [...new Map(data.map((profile) => [profile.id, profile])).values()],
+        degradations: [],
+      };
+    } catch {
+      return {
+        data: [],
+        degradations: [
+          {
+            code: "feature-unavailable",
+            feature: "permissions",
+            message:
+              "Codex did not provide selectable permissions; the message and settings were not changed.",
+          },
+        ],
+      };
+    }
+  }
+
+  async listApprovalReviewers(): Promise<ServiceResult<ApprovalReviewerOption[]>> {
+    try {
+      const response = asRecord(await this.#gateway.request("configRequirements/read"));
+      const requirements = asRecord(response.requirements);
+      const reviewers = selectAllowedProtocolOptions(
+        requirements.allowedApprovalsReviewers,
+        this.#protocolApprovalReviewers,
+      );
+      const data = [...new Set(reviewers)].map((id) => ({ id }));
+      if (data.length === 0) {
+        throw new Error("approval reviewer catalog is empty");
+      }
+      return { data, degradations: [] };
+    } catch {
+      return {
+        data: [],
+        degradations: [
+          {
+            code: "feature-unavailable",
+            feature: "approval-reviewer",
+            message:
+              "Codex did not expose selectable approval reviewers; no guessed value was sent, and the current Codex setting will be kept.",
+          },
+        ],
+      };
+    }
+  }
+
+  async listApprovalPolicies(): Promise<ServiceResult<ApprovalPolicyOption[]>> {
+    try {
+      const response = asRecord(await this.#gateway.request("configRequirements/read"));
+      const requirements = asRecord(response.requirements);
+      const policies = selectAllowedProtocolOptions(
+        requirements.allowedApprovalPolicies,
+        this.#protocolApprovalPolicies,
+      );
+      const data = [...new Set(policies)].map((id) => ({ id }));
+      if (data.length === 0) {
+        throw new Error("approval policy catalog is empty");
+      }
+      return { data, degradations: [] };
+    } catch {
+      return {
+        data: [],
+        degradations: [
+          {
+            code: "feature-unavailable",
+            feature: "approval-policy",
+            message:
+              "Codex did not expose selectable approval policies; no guessed value was sent, and the current Codex setting will be kept.",
+          },
+        ],
+      };
+    }
+  }
+
+  async listCollaborationModes(): Promise<ServiceResult<CollaborationModeOption[]>> {
+    try {
+      const response = asRecord(await this.#gateway.request("collaborationMode/list", {}));
+      const modes: CollaborationModeOption[] = [];
+      for (const mode of asRecordArray(response.data)) {
+        const id = asString(mode.name);
+        if (id) {
+          modes.push({
+            available: true,
+            displayName: collaborationDisplayName(id),
+            id,
+          });
+        }
+      }
+      return { data: modes, degradations: [] };
+    } catch {
+      return {
+        data: [],
+        degradations: [collaborationUnavailable()],
+      };
+    }
+  }
+
+  async getUsage(threadId?: string): Promise<ServiceResult<UsageSnapshot>> {
+    const updatedAt = new Date().toISOString();
+    if (threadId !== undefined) {
+      await this.#hydrateUsageContext(threadId);
+    }
+    const context = this.#usageContextFor(threadId);
+    const [accountResult, rateLimitResult, tokenUsageResult] = await Promise.allSettled([
+      this.#gateway.request("account/read", { refreshToken: false }),
+      this.#gateway.request("account/rateLimits/read"),
+      this.#gateway.request("account/usage/read"),
+    ]);
+    const degradations: ServiceDegradation[] = [];
+    const account =
+      accountResult.status === "fulfilled" ? asRecord(asRecord(accountResult.value).account) : {};
+    const codexAccount = projectCodexAccountIdentity(account);
+    if (accountResult.status === "rejected") {
+      degradations.push(usageDegradation("Account plan information is temporarily unavailable."));
+    }
+
+    let windows: UsageWindow[] = [];
+    let credits: UsageCredits[] | undefined;
+    if (rateLimitResult.status === "fulfilled") {
+      const rateLimits = asRecord(rateLimitResult.value);
+      windows = projectUsageWindows(rateLimits);
+      credits = projectUsageCredits(rateLimits);
+    } else {
+      degradations.push(
+        usageDegradation("Usage limits are temporarily unavailable; refresh later."),
+      );
+    }
+
+    let tokenUsageSummary: AccountTokenUsageSummary | undefined;
+    let dailyUsageBuckets: DailyTokenUsage[] | undefined;
+    if (tokenUsageResult.status === "fulfilled") {
+      const usage = asRecord(tokenUsageResult.value);
+      tokenUsageSummary = projectAccountTokenUsageSummary(usage.summary);
+      dailyUsageBuckets = projectDailyTokenUsage(usage.dailyUsageBuckets);
+    } else {
+      degradations.push(usageDegradation("Lifetime and daily usage are temporarily unavailable."));
+    }
+
+    const plan = asString(account.planType);
+    return {
+      data: {
+        updatedAt,
+        availability: {
+          account: accountResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+          rateLimits:
+            rateLimitResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+          tokenUsage:
+            tokenUsageResult.status === "fulfilled" ? "available" : "temporarily-unavailable",
+        },
+        windows,
+        ...(codexAccount === undefined ? {} : { codexAccount }),
+        ...(plan === undefined ? {} : { plan }),
+        ...(credits === undefined ? {} : { credits }),
+        ...(tokenUsageSummary === undefined ? {} : { tokenUsageSummary }),
+        ...(dailyUsageBuckets === undefined ? {} : { dailyUsageBuckets }),
+        ...(context === undefined ? {} : { context }),
+      },
+      degradations,
+    };
+  }
+
+  async listThreads(
+    options: {
+      archived?: boolean;
+      cursor?: string;
+      limit?: number;
+      projectId?: string;
+      searchTerm?: string;
+    } = {},
+  ): Promise<ThreadPage> {
+    await this.#refreshProjectRegistry();
+    const includeActiveInventory =
+      options.cursor === undefined &&
+      options.archived !== true &&
+      options.projectId === undefined &&
+      options.searchTerm === undefined;
+    if (includeActiveInventory && this.#sharedAppServer) {
+      const inventoryRefresh = this.resubscribeSharedThreads().catch(() => undefined);
+      await Promise.race([inventoryRefresh, delay(SHARED_INVENTORY_FAST_PATH_MS)]);
+      // History remains usable while a large shared loaded-thread inventory
+      // continues in the background. The next Web refresh merges the
+      // authoritative active roots after reconciliation completes.
+    }
+    const baseParams: Record<string, unknown> = {
+      archived: options.archived === true,
+      limit: Math.min(Math.max(options.limit ?? 25, 1), 100),
+      sortKey: "updated_at",
+      sortDirection: "desc",
+    };
+    if (options.cursor) {
+      baseParams.cursor = options.cursor;
+    }
+    if (options.searchTerm) {
+      baseParams.searchTerm = options.searchTerm;
+    }
+    if (options.projectId) {
+      baseParams.cwd = this.projects.requireRoot(options.projectId);
+    }
+
+    const rawThreads: Record<string, unknown>[] = [];
+    let cursor = options.cursor;
+    let nextCursor: string | undefined;
+    const pageLimit = 1;
+    for (let page = 0; page < pageLimit; page += 1) {
+      const response = asRecord(
+        await this.#gateway.request("thread/list", {
+          ...baseParams,
+          ...(cursor === undefined ? {} : { cursor }),
+        }),
+      );
+      rawThreads.push(...asRecordArray(response.data));
+      nextCursor = asString(response.nextCursor);
+      if (!nextCursor) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+    await this.#refreshPinnedThreadIds();
+    if (
+      options.cursor === undefined &&
+      options.archived !== true &&
+      options.projectId === undefined &&
+      options.searchTerm === undefined &&
+      this.#pinnedThreadRanks.size > 0
+    ) {
+      rawThreads.push(...(await this.#readMissingPinnedThreads(rawThreads)));
+    }
+    await this.#discoverThreadProjects(rawThreads);
+    this.#historyTruncated = nextCursor !== undefined && !options.cursor;
+    if (this.#historyTruncated) {
+      this.#events?.append("diagnostic", {
+        code: "history-truncated",
+        message:
+          "There are many historical conversations; load earlier records from the conversation page.",
+      });
+    }
+    const uniqueThreads = new Map<string, Record<string, unknown>>();
+    for (const thread of rawThreads) {
+      const id = asString(thread.id);
+      if (id && !uniqueThreads.has(id)) {
+        uniqueThreads.set(id, thread);
+      }
+    }
+    const listedThreadIds = new Set(uniqueThreads.keys());
+    for (const thread of uniqueThreads.values()) {
+      const threadId = asString(thread.id);
+      if (threadId !== undefined) {
+        this.#rememberUsageFromSource(threadId, thread);
+        if (this.#sharedAppServer && options.archived !== true) {
+          this.#rememberSharedThreadSnapshot(thread);
+        }
+      }
+    }
+    const activeRootIds = includeActiveInventory
+      ? this.#activeTopLevelThreadIds()
+      : new Set<string>();
+    if (includeActiveInventory) {
+      for (const [threadId, thread] of this.#sharedThreadSnapshots) {
+        const rootThreadId = topLevelThreadId(threadId, this.#sharedThreadSnapshots);
+        if (rootThreadId && activeRootIds.has(rootThreadId)) {
+          uniqueThreads.set(threadId, thread);
+        }
+      }
+    }
+    const descendantCounts = descendantCountsByRoot(uniqueThreads);
+    const data = [...uniqueThreads.values()]
+      .filter((thread) => asString(thread.parentThreadId) === undefined)
+      .filter((thread) => {
+        const threadId = asString(thread.id);
+        return (
+          threadId !== undefined && (listedThreadIds.has(threadId) || activeRootIds.has(threadId))
+        );
+      })
+      .map((thread) => {
+        const threadId = asString(thread.id) ?? "";
+        return {
+          ...this.#projectTopLevelThreadSummary(
+            thread,
+            uniqueThreads,
+            descendantCounts.get(threadId),
+          ),
+          archived: options.archived === true,
+        };
+      })
+      .sort((left, right) => {
+        if (left.pinnedRank !== undefined || right.pinnedRank !== undefined) {
+          if (left.pinnedRank === undefined) return 1;
+          if (right.pinnedRank === undefined) return -1;
+          if (left.pinnedRank !== right.pinnedRank) {
+            return left.pinnedRank - right.pinnedRank;
+          }
+        }
+        return right.updatedAt.localeCompare(left.updatedAt);
+      });
+    return {
+      data,
+      ...(nextCursor === undefined ? {} : { nextCursor }),
+    };
+  }
+
+  get historyTruncated(): boolean {
+    return this.#historyTruncated;
+  }
+
+  async resubscribeSharedThreads(): Promise<void> {
+    if (!this.#sharedAppServer) {
+      return;
+    }
+    if (this.#sharedInventoryRefreshPromise) {
+      await this.#sharedInventoryRefreshPromise;
+      return;
+    }
+    const refresh = (async () => {
+      await this.#reconcileArchiveIntentsAndPinnedThreads();
+      await this.#refreshSharedThreadInventory();
+    })();
+    this.#sharedInventoryRefreshPromise = refresh;
+    try {
+      await refresh;
+    } finally {
+      if (this.#sharedInventoryRefreshPromise === refresh) {
+        this.#sharedInventoryRefreshPromise = undefined;
+      }
+    }
+  }
+
+  async #refreshSharedThreadInventory(): Promise<void> {
+    this.#sharedInventoryComplete = false;
+    const previouslyActiveThreadIds = new Set(this.#activeThreadIds);
+    const loadedThreadIds = new Set<string>();
+    let cursor: string | undefined;
+    let loadedInventoryExhausted = false;
+    for (let page = 0; page < MAX_LOADED_THREAD_PAGES; page += 1) {
+      const response = asRecord(
+        await this.#gateway.request("thread/loaded/list", {
+          ...(cursor === undefined ? {} : { cursor }),
+          limit: 100,
+        }),
+      );
+      for (const entry of asRecordArray(response.data)) {
+        const threadId = asString(entry.id);
+        if (threadId) {
+          loadedThreadIds.add(threadId);
+        }
+      }
+      if (Array.isArray(response.data)) {
+        for (const entry of response.data) {
+          if (typeof entry === "string" && entry.trim()) {
+            loadedThreadIds.add(entry);
+          }
+        }
+      }
+      const nextCursor = asString(response.nextCursor);
+      if (!nextCursor) {
+        loadedInventoryExhausted = true;
+        break;
+      }
+      if (nextCursor === cursor) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+    this.#loadedThreadIds.clear();
+    for (const threadId of loadedThreadIds) {
+      this.#loadedThreadIds.add(threadId);
+    }
+    const threadIds = [...new Set([...loadedThreadIds, ...previouslyActiveThreadIds])];
+    let loadedThreadsHydrated = true;
+    for (let offset = 0; offset < threadIds.length; offset += LOADED_THREAD_BACKFILL_BATCH_SIZE) {
+      const results = await Promise.allSettled(
+        threadIds
+          .slice(offset, offset + LOADED_THREAD_BACKFILL_BATCH_SIZE)
+          .map(async (threadId) => {
+            await this.#ensureSharedThread(threadId);
+          }),
+      );
+      loadedThreadsHydrated &&= results.every((result) => result.status === "fulfilled");
+    }
+    await this.#hydrateSharedThreadAncestors(threadIds);
+    loadedThreadsHydrated &&= threadIds.every(
+      (threadId) => topLevelThreadId(threadId, this.#sharedThreadSnapshots) !== undefined,
+    );
+    await this.#promoteLoadedSharedRoots(loadedThreadIds);
+    this.#publishTopLevelSnapshotsFor(
+      new Set([...previouslyActiveThreadIds, ...this.#activeThreadIds, ...this.#loadedThreadIds]),
+    );
+    this.#sharedInventoryComplete = loadedInventoryExhausted && loadedThreadsHydrated;
+  }
+
+  async getThread(
+    threadId: string,
+    options: { historyCursor?: string; includeTurns?: boolean } = {},
+  ): Promise<ThreadDetail> {
+    requireNonEmpty(threadId, "thread id");
+    const localHistoryCursor = options.historyCursor?.startsWith(
+      PERSISTED_CONVERSATION_CURSOR_PREFIX,
+    )
+      ? options.historyCursor
+      : undefined;
+    if (localHistoryCursor !== undefined && this.#readPersistedConversationItems === undefined) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current Sidecar cannot continue reading the local history page",
+        409,
+      );
+    }
+    await this.#refreshPinnedThreadIds();
+    if (this.#managedThreads.has(threadId)) {
+      await this.#ensureSharedThread(threadId);
+    } else if (this.#sharedAppServer && this.#loadedThreadIds.has(threadId)) {
+      await this.#ensureSharedThread(threadId);
+      await this.#hydrateSharedThreadAncestors([threadId]);
+      await this.#promoteSharedTopLevelThread(threadId);
+    }
+    if (
+      options.historyCursor === undefined &&
+      this.#isControllableThread(threadId) &&
+      this.#restoredThreadsNeedingRefresh.has(threadId)
+    ) {
+      const restored = await this.#refreshRestoredThread(threadId);
+      if (restored) {
+        return this.#withControlState(restored);
+      }
+    }
+    let persistedThreadHead: PersistedThreadHead | undefined;
+    let bypassAppServerHistory = false;
+    let response: Record<string, unknown>;
+    if (localHistoryCursor !== undefined) {
+      const cachedThread = this.#sharedThreadSnapshots.get(threadId);
+      const cachedSessionPath = asString(cachedThread?.path);
+      response =
+        asString(cachedThread?.id) === threadId
+          ? {
+              thread: cachedThread,
+              ...(cachedSessionPath === undefined ? {} : { path: cachedSessionPath }),
+            }
+          : await this.#readThreadForDisplay(threadId, false);
+    } else if (
+      this.#sharedAppServer &&
+      this.#readPersistedThreadHead !== undefined &&
+      options.historyCursor === undefined
+    ) {
+      const cachedThread = this.#sharedThreadSnapshots.get(threadId);
+      const cachedSessionPath = asString(cachedThread?.path);
+      const cachedShell =
+        asString(cachedThread?.id) === threadId
+          ? {
+              thread: cachedThread,
+              ...(cachedSessionPath === undefined ? {} : { path: cachedSessionPath }),
+            }
+          : undefined;
+      const shellResponse = cachedShell ?? (await this.#readThreadForDisplay(threadId, false));
+      const shellThread = asRecord(shellResponse.thread);
+      const shellSessionPath = asString(shellThread.path) ?? asString(shellResponse.path);
+      persistedThreadHead = await this.#readPersistedThreadHeadSafely(threadId, shellSessionPath);
+      bypassAppServerHistory =
+        options.includeTurns !== false &&
+        ((persistedThreadHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES ||
+          !this.#protocolClientMethods.has("thread/turns/list"));
+      response =
+        options.includeTurns === false || bypassAppServerHistory
+          ? shellResponse
+          : await this.#readThreadForDisplay(threadId, true, undefined, shellResponse);
+    } else {
+      response = await this.#readThreadForDisplay(
+        threadId,
+        options.includeTurns !== false,
+        options.historyCursor,
+      );
+    }
+    const thread = asRecord(response.thread);
+    if (!asString(thread.id)) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    this.#rememberRuntimeSettings(threadId, response);
+    this.#rememberUsageFromSource(threadId, response);
+    const sessionPath = asString(thread.path) ?? asString(response.path);
+    if (options.historyCursor === undefined) {
+      await this.#hydratePersistedRuntimeSettings(threadId, sessionPath);
+    }
+    await this.#refreshProjectRegistry();
+    await this.#ensureThreadProjectDiscovered(thread);
+    const projectId = this.#projectIdForCwd(thread.cwd);
+    let detail = projectThreadDetail(thread, {
+      directInputAvailable: this.#isDirectInputAvailable(threadId),
+      managed: this.#isControllableThread(threadId),
+      ...this.#pinnedProjectionOptions(threadId),
+      ...this.#runtimeProjectionOptions(threadId),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
+    const historyNextCursor = asString(response.historyNextCursor);
+    if (historyNextCursor !== undefined) {
+      detail = { ...detail, historyNextCursor };
+    }
+    if (
+      this.#readPersistedConversationItems !== undefined &&
+      options.includeTurns !== false &&
+      (options.historyCursor === undefined || localHistoryCursor !== undefined)
+    ) {
+      const persistedHistoryScope: PersistedConversationHistoryScope =
+        bypassAppServerHistory || localHistoryCursor !== undefined
+          ? "recent"
+          : asString(thread.parentThreadId) === undefined
+            ? "recent"
+            : "complete";
+      try {
+        const persistedResult =
+          localHistoryCursor === undefined
+            ? await this.#readPersistedConversationItems(
+                threadId,
+                sessionPath,
+                persistedHistoryScope,
+              )
+            : await this.#readPersistedConversationItems(
+                threadId,
+                sessionPath,
+                persistedHistoryScope,
+                localHistoryCursor,
+              );
+        const persistedItems = Array.isArray(persistedResult)
+          ? persistedResult
+          : persistedResult.items;
+        const persistedNextCursor = Array.isArray(persistedResult)
+          ? undefined
+          : persistedResult.historyNextCursor;
+        detail = {
+          ...detail,
+          items:
+            localHistoryCursor === undefined
+              ? mergePersistedConversationItems(detail.items, persistedItems)
+              : persistedItems,
+          ...(Array.isArray(persistedResult)
+            ? {}
+            : { persistedHistoryIntegrity: persistedResult.integrity }),
+        };
+        if (bypassAppServerHistory || localHistoryCursor !== undefined) {
+          const { historyNextCursor: _nativeHistoryCursor, ...detailWithoutNativeCursor } = detail;
+          detail = {
+            ...detailWithoutNativeCursor,
+            ...(persistedNextCursor === undefined
+              ? {}
+              : { historyNextCursor: persistedNextCursor }),
+            historyLoadPolicy: "explicit",
+          };
+        }
+      } catch {
+        const failedIntegrity = {
+          observedCount: 0,
+          reason: "read-failed" as const,
+          scope: persistedHistoryScope,
+          status: "failed" as const,
+        };
+        if (bypassAppServerHistory || localHistoryCursor !== undefined) {
+          const { historyNextCursor: _historyNextCursor, ...detailWithoutCursor } = detail;
+          detail = {
+            ...detailWithoutCursor,
+            ...(localHistoryCursor === undefined ? {} : { items: [] }),
+            historyLoadPolicy: "explicit",
+            persistedHistoryIntegrity: failedIntegrity,
+          };
+        } else {
+          detail = { ...detail, persistedHistoryIntegrity: failedIntegrity };
+        }
+      }
+    }
+    if (isInitialTurnSafelyTerminal(thread)) {
+      void this.#notifyManagedThreadAfterInitialTurn(threadId);
+    }
+    if (this.#sharedAppServer) {
+      if (localHistoryCursor === undefined) {
+        detail = await this.#recoverSharedActiveTurn(detail, sessionPath, persistedThreadHead);
+        this.#markExistingActiveTurnUncontrollable(detail);
+      }
+    }
+    return this.#withControlState(detail);
+  }
+
+  async #readThreadForDisplay(
+    threadId: string,
+    includeTurns: boolean,
+    historyCursor?: string,
+    suppliedShell?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!includeTurns) {
+      if (suppliedShell !== undefined) return suppliedShell;
+      return asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: false,
+          threadId,
+        }),
+      );
+    }
+
+    if (
+      this.#protocolClientMethods.has("thread/items/list") &&
+      this.#protocolClientMethods.has("thread/turns/list")
+    ) {
+      try {
+        const [shellResult, itemsResult, turnsResult] = await Promise.all([
+          suppliedShell ??
+            this.#gateway.request("thread/read", {
+              includeTurns: false,
+              threadId,
+            }),
+          this.#gateway.request("thread/items/list", {
+            ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
+            limit: 160,
+            sortDirection: "desc",
+            threadId,
+          }),
+          this.#gateway.request("thread/turns/list", {
+            itemsView: "summary",
+            limit: 12,
+            sortDirection: "desc",
+            threadId,
+          }),
+        ]);
+        const shell = asRecord(shellResult);
+        const rawThread = asRecord(shell.thread);
+        const itemPage = asRecord(itemsResult);
+        const itemEntries = asRecordArray(itemPage.data).reverse();
+        const turnSummaries = asRecordArray(asRecord(turnsResult).data).reverse();
+        const historyNextCursor = asString(itemPage.nextCursor);
+        const itemsByTurn = new Map<string, unknown[]>();
+        const orderedTurnIds: string[] = [];
+        for (const entry of itemEntries) {
+          const turnId = asString(entry.turnId);
+          if (!turnId || entry.item === undefined) continue;
+          let items = itemsByTurn.get(turnId);
+          if (!items) {
+            items = [];
+            itemsByTurn.set(turnId, items);
+            orderedTurnIds.push(turnId);
+          }
+          items.push(entry.item);
+        }
+        const summariesByTurn = new Map(
+          turnSummaries.flatMap((turn) => {
+            const turnId = asString(turn.id);
+            return turnId ? [[turnId, turn] as const] : [];
+          }),
+        );
+        for (const turn of turnSummaries) {
+          const turnId = asString(turn.id);
+          if (turnId && !itemsByTurn.has(turnId)) orderedTurnIds.push(turnId);
+        }
+        const recentTurns = [...new Set(orderedTurnIds)].map((turnId) => ({
+          ...(summariesByTurn.get(turnId) ?? { id: turnId, status: "completed" }),
+          id: turnId,
+          items: itemsByTurn.get(turnId) ?? [],
+        }));
+        return {
+          ...shell,
+          ...(historyNextCursor === undefined ? {} : { historyNextCursor }),
+          historyReadDiagnostic: {
+            observedCount: itemEntries.length,
+            status: historyNextCursor === undefined ? "exhausted" : "more-available",
+          } satisfies ThreadHistoryReadDiagnostic,
+          thread: {
+            ...rawThread,
+            turns: recentTurns,
+          },
+        };
+      } catch (error) {
+        if (historyCursor !== undefined) throw error;
+        // A newly introduced item page may be temporarily unavailable even
+        // when its schema is present. Fall through to bounded turn pages.
+      }
+    }
+
+    if (!this.#protocolClientMethods.has("thread/turns/list")) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "This Codex version does not support safe pagination for long conversations; the remote service will not read unbounded history",
+        409,
+      );
+    }
+
+    try {
+      const [shellResult, turnsResult] = await Promise.all([
+        suppliedShell ??
+          this.#gateway.request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
+        this.#gateway.request("thread/turns/list", {
+          ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
+          itemsView: "full",
+          limit: 12,
+          sortDirection: "desc",
+          threadId,
+        }),
+      ]);
+      const shell = asRecord(shellResult);
+      const rawThread = asRecord(shell.thread);
+      const turnPage = asRecord(turnsResult);
+      const recentTurns = asRecordArray(turnPage.data).reverse();
+      const historyNextCursor = asString(turnPage.nextCursor);
+      return {
+        ...shell,
+        ...(historyNextCursor === undefined ? {} : { historyNextCursor }),
+        historyReadDiagnostic: {
+          observedCount: recentTurns.length,
+          status: historyNextCursor === undefined ? "exhausted" : "more-available",
+        } satisfies ThreadHistoryReadDiagnostic,
+        thread: {
+          ...rawThread,
+          turns: recentTurns,
+        },
+      };
+    } catch {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "Pagination is temporarily unavailable in this Codex version; unbounded history reading was not used to avoid hanging on long conversations",
+        409,
+      );
+    }
+  }
+
+  async reconcilePendingDesktopNotifications(): Promise<void> {
+    if (this.#desktopReconciliationPromise) {
+      await this.#desktopReconciliationPromise;
+      return;
+    }
+    const reconciliation = this.#runDesktopNotificationReconciliation();
+    this.#desktopReconciliationPromise = reconciliation;
+    try {
+      await reconciliation;
+    } finally {
+      if (this.#desktopReconciliationPromise === reconciliation) {
+        this.#desktopReconciliationPromise = undefined;
+      }
+    }
+  }
+
+  async createThread(input: CreateThreadInput): Promise<ServiceResult<ThreadDetail>> {
+    const prompt = requireNonEmpty(input.prompt, "message");
+    const cwd = await this.#requireNewThreadRoot(input.projectId);
+    const turnInput = await this.#resolveTurnInput(prompt, input.attachments, input.projectId);
+    if (input.permissionProfileId !== undefined && input.permissionMode !== undefined) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "Dynamic permissions and the legacy permission mode cannot both be set",
+        400,
+      );
+    }
+    if (input.permissionProfileId !== undefined) {
+      const profiles = await this.listPermissionProfiles({
+        ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
+      });
+      const selected = profiles.data.find((profile) => profile.id === input.permissionProfileId);
+      if (!selected?.allowed) {
+        throw new DomainError(
+          "INVALID_INPUT",
+          "This permission is unavailable; the new conversation was not created.",
+          409,
+        );
+      }
+    }
+    if (input.approvalsReviewer !== undefined) {
+      await this.#requireAvailableApprovalReviewer(input.approvalsReviewer);
+    }
+    if (input.approvalPolicy !== undefined) {
+      await this.#requireAvailableApprovalPolicy(input.approvalPolicy);
+    }
+    const startParams: Record<string, unknown> = {
+      cwd,
+      threadSource: "codex-local-remote",
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+      ...(input.approvalsReviewer === undefined
+        ? {}
+        : { approvalsReviewer: input.approvalsReviewer }),
+      ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+      ...(input.permissionProfileId === undefined
+        ? permissionParams(input.permissionMode)
+        : { permissions: input.permissionProfileId }),
+    };
+    const startResponse = asRecord(await this.#gateway.request("thread/start", startParams));
+    const thread = asRecord(startResponse.thread);
+    const threadId = asString(thread.id);
+    if (!threadId) {
+      throw new DomainError("THREAD_NOT_FOUND", "Codex did not return a new conversation", 502);
+    }
+
+    const degradations: ServiceDegradation[] = [];
+    // Default is already the app-server's ordinary mode. Re-sending it as a
+    // collaboration preset with a user-selected model makes Desktop label the
+    // thread as "Custom" even though the turn really used that model.
+    if (input.collaborationMode && input.collaborationMode.trim().toLowerCase() !== "default") {
+      const degradation = await this.#configureCollaboration(
+        threadId,
+        input.collaborationMode,
+        input.model ?? asString(startResponse.model),
+        input.reasoningEffort,
+      );
+      if (degradation) {
+        degradations.push(degradation);
+      }
+    }
+
+    // thread/start only creates an idle shell. Recheck the registered directory
+    // identity immediately before the first turn can perform filesystem work.
+    await this.#requireNewThreadRoot(input.projectId);
+    // Loading the same thread in Desktop while this app-server owns its first
+    // turn can interrupt that turn. Persist visibility together with ownership
+    // now, but open it only after a matching terminal state is observed.
+    await this.#markManaged(
+      threadId,
+      !this.#sharedAppServer && this.#notifyManagedThreadCreated !== undefined,
+    );
+    this.#rememberDirectInput(threadId, thread);
+    this.#rememberRuntimeSettings(threadId, startResponse);
+    this.#rememberRuntimeSettings(threadId, {
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+      ...(input.permissionProfileId === undefined
+        ? {}
+        : { permissionProfileId: input.permissionProfileId }),
+      ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+      ...(input.approvalsReviewer === undefined
+        ? {}
+        : { approvalsReviewer: input.approvalsReviewer }),
+      ...(input.collaborationMode === undefined
+        ? {}
+        : { collaborationMode: input.collaborationMode }),
+    });
+
+    this.#pendingTurnStarts.add(threadId);
+    let turnResponse: Record<string, unknown>;
+    try {
+      turnResponse = asRecord(
+        await this.#gateway.request("turn/start", {
+          threadId,
+          input: turnInput,
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.reasoningEffort === undefined ? {} : { effort: input.reasoningEffort }),
+          ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+          ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+          ...(input.approvalsReviewer === undefined
+            ? {}
+            : { approvalsReviewer: input.approvalsReviewer }),
+          ...(input.permissionProfileId === undefined
+            ? {}
+            : { permissions: input.permissionProfileId }),
+        }),
+      );
+    } catch (error) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      this.#turnStartTerminalStatusesBeforeResponse.delete(threadId);
+      if (this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+        this.#restoredPendingDesktopNotifications.add(threadId);
+        await this.#discardPendingDesktopNotification(threadId);
+      }
+      throw error;
+    } finally {
+      this.#pendingTurnStarts.delete(threadId);
+    }
+    const turn = asRecord(turnResponse.turn);
+    const turnId = asString(turn.id);
+    const terminalBeforeResponse = this.#consumeTurnTerminalBeforeResponse(threadId, turnId);
+    if (turnId && !terminalBeforeResponse.observed) {
+      this.#activeTurns.set(threadId, turnId);
+      this.#orphanedActiveTurns.delete(threadId);
+    }
+    if (this.#sharedAppServer) {
+      this.#sharedSubscribedThreads.add(threadId);
+    }
+    if (this.#sharedAppServer) {
+      try {
+        await this.#notifyManagedThreadCreated?.(threadId);
+      } catch {
+        // In shared mode turn/start is the persistence/subscription barrier.
+        // Navigation remains best effort, but it must never run before the
+        // Desktop connection can resume and hydrate the real running thread.
+      }
+    }
+    const projectedTurn = terminalBeforeResponse.completedByTurnEvent
+      ? { ...turn, status: "completed" }
+      : turn;
+    const projectedThread = terminalBeforeResponse.observed
+      ? {
+          ...thread,
+          status: terminalBeforeResponse.threadStatus ?? { type: "idle" },
+          turns: [...asRecordArray(thread.turns), projectedTurn],
+        }
+      : {
+          ...thread,
+          status: { type: "active", activeFlags: [] },
+          turns: [...asRecordArray(thread.turns), projectedTurn],
+        };
+
+    return {
+      data: projectThreadDetail(projectedThread, {
+        directInputAvailable: this.#isDirectInputAvailable(threadId),
+        managed: true,
+        ...this.#pinnedProjectionOptions(threadId),
+        ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
+        ...this.#runtimeProjectionOptions(threadId),
+      }),
+      degradations,
+    };
+  }
+
+  async #requireNewThreadRoot(projectId: string | undefined): Promise<string> {
+    if (projectId === undefined) {
+      if (!this.#generalConversationRoot) {
+        throw new DomainError(
+          "INVALID_INPUT",
+          "No projectless conversation directory is configured",
+          400,
+        );
+      }
+      return this.#generalConversationRoot;
+    }
+    return await this.#requireAuthorizedProjectRoot(projectId);
+  }
+
+  async #resolveTurnInput(
+    prompt: string,
+    attachments: readonly LocalInputReference[] | undefined,
+    expectedProjectId: string | undefined,
+  ): Promise<AppServerUserInput[]> {
+    const input: AppServerUserInput[] = [textInput(prompt)];
+    if (!attachments?.length) {
+      return input;
+    }
+    if (!this.#resolveLocalInputReference) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current version cannot add files or folders yet",
+        503,
+      );
+    }
+    if (attachments.length > 20) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "At most 20 files or folders can be added at once",
+        400,
+      );
+    }
+    const seen = new Set<string>();
+    for (const reference of attachments) {
+      const projectReference =
+        reference.projectId !== undefined && reference.uploadId === undefined;
+      const uploadReference = reference.uploadId !== undefined && reference.projectId === undefined;
+      if (
+        (!projectReference && !uploadReference) ||
+        (projectReference &&
+          (expectedProjectId === undefined || reference.projectId !== expectedProjectId)) ||
+        (uploadReference && reference.kind !== "file") ||
+        (reference.kind !== "file" && reference.kind !== "directory") ||
+        !reference.relativePath.trim() ||
+        reference.relativePath.length > 32_768
+      ) {
+        throw new DomainError(
+          "PROJECT_NOT_AUTHORIZED",
+          projectReference && expectedProjectId === undefined
+            ? "A projectless conversation cannot reference computer files"
+            : "The attachment source or path is invalid",
+          403,
+        );
+      }
+      const key = `${reference.projectId ?? reference.uploadId}:${reference.kind}:${reference.relativePath.toLocaleLowerCase("en-US")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let resolved: ResolvedLocalInputReference;
+      try {
+        resolved = await this.#resolveLocalInputReference(reference);
+      } catch {
+        throw new DomainError(
+          "PROJECT_NOT_AUTHORIZED",
+          "The attachment was moved, is inaccessible, or is no longer part of the current project",
+          403,
+        );
+      }
+      if (
+        resolved.kind !== reference.kind ||
+        !resolved.name.trim() ||
+        resolved.name.length > 1_024 ||
+        !path.win32.isAbsolute(resolved.path) ||
+        resolved.path.length > 32_768
+      ) {
+        throw new DomainError("PROJECT_NOT_AUTHORIZED", "Attachment path validation failed", 403);
+      }
+      input.push(
+        resolved.kind === "file" && isImageAttachment(resolved.path)
+          ? { path: resolved.path, type: "localImage" }
+          : { name: resolved.name, path: resolved.path, type: "mention" },
+      );
+    }
+    return input;
+  }
+
+  async #requireAuthorizedProjectRoot(projectId: string): Promise<string> {
+    await this.#refreshProjectRegistry();
+    const registeredRoot = this.projects.requireRegisteredRoot(projectId);
+    let authorizedRoot: string | undefined;
+    try {
+      authorizedRoot = await this.#resolveRegisteredProjectRoot(projectId);
+    } catch {
+      authorizedRoot = undefined;
+    }
+    const rootValidation = authorizedRoot
+      ? validateSafeWindowsProjectRoot(authorizedRoot)
+      : undefined;
+    if (
+      !rootValidation?.ok ||
+      rootValidation.normalized.toLocaleLowerCase("en-US") !==
+        registeredRoot.toLocaleLowerCase("en-US")
+    ) {
+      throw new DomainError(
+        "PROJECT_NOT_AUTHORIZED",
+        "The project directory has changed; register it again on the local computer before continuing",
+        403,
+      );
+    }
+    return rootValidation.normalized;
+  }
+
+  async resumeThread(threadId: string): Promise<ThreadDetail> {
+    requireNonEmpty(threadId, "thread id");
+    if (this.#sharedAppServer) {
+      try {
+        await this.#ensureSharedThread(threadId);
+      } catch (error) {
+        throw sharedHistoryResumeError(error);
+      }
+      await this.#hydrateSharedThreadAncestors([threadId]);
+      const snapshot = this.#sharedThreadSnapshots.get(threadId);
+      if (asString(snapshot?.parentThreadId) !== undefined) {
+        throw new DomainError(
+          "THREAD_READ_ONLY",
+          "Subagents are controlled by their parent task; resume the parent task first.",
+          409,
+        );
+      }
+      await this.#requireAuthorizedThreadProjectRoot(threadId);
+      await this.#markManaged(threadId, false);
+      return await this.getThread(threadId);
+    }
+    const response = asRecord(await this.#gateway.request("thread/resume", { threadId }));
+    const thread = asRecord(response.thread);
+    if (asString(thread.id) !== threadId) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    await this.#refreshProjectRegistry();
+    await this.#ensureThreadProjectDiscovered(thread);
+    const projectId = this.#projectIdForCwd(thread.cwd);
+    if (projectId === undefined && !this.#isGeneralConversationRoot(thread.cwd)) {
+      throw new DomainError(
+        "PROJECT_NOT_AUTHORIZED",
+        "This conversation's project is not registered on the local computer; remote continuation is temporarily unavailable.",
+        403,
+      );
+    }
+    if (projectId !== undefined) {
+      await this.#requireAuthorizedProjectRoot(projectId);
+    }
+    await this.#markManaged(threadId, false);
+    this.#rememberDirectInput(threadId, thread);
+    this.#rememberRuntimeSettings(threadId, response);
+    const detail = projectThreadDetail(thread, {
+      directInputAvailable: this.#isDirectInputAvailable(threadId),
+      managed: true,
+      ...this.#pinnedProjectionOptions(threadId),
+      ...this.#runtimeProjectionOptions(threadId),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
+    this.#restoredThreadsNeedingRefresh.delete(threadId);
+    this.#markExistingActiveTurnUncontrollable(detail);
+    return this.#withControlState(detail);
+  }
+
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    const normalizedThreadId = requireNonEmpty(threadId, "thread id");
+    const normalizedName = requireThreadName(name);
+    this.#requireProtocolMethods(
+      ["thread/name/set"],
+      "This Codex version does not support renaming conversations; update Desktop and try again.",
+    );
+    await this.#requireAuthorizedThreadProjectRoot(normalizedThreadId);
+    await this.#gateway.request("thread/name/set", {
+      threadId: normalizedThreadId,
+      name: normalizedName,
+    });
+    const cached = this.#sharedThreadSnapshots.get(normalizedThreadId);
+    if (cached !== undefined) {
+      this.#rememberSharedThreadSnapshot({ ...cached, name: normalizedName });
+      this.#publishTopLevelSnapshotsFor(new Set([normalizedThreadId]));
+    }
+    this.#events?.append(
+      "thread.updated",
+      { name: normalizedName, threadId: normalizedThreadId },
+      { threadId: normalizedThreadId },
+    );
+  }
+
+  async setThreadArchived(threadId: string, archived: boolean): Promise<void> {
+    const normalizedThreadId = requireNonEmpty(threadId, "thread id");
+    await this.#runArchiveMutation(normalizedThreadId, async () => {
+      await this.#setThreadArchivedOnce(normalizedThreadId, archived);
+    });
+  }
+
+  async #setThreadArchivedOnce(normalizedThreadId: string, archived: boolean): Promise<void> {
+    this.#requireProtocolMethods(
+      ["thread/archive", "thread/unarchive"],
+      "This Codex version does not support archiving and restoring; update Desktop and try again.",
+    );
+    if (archived && this.#sharedAppServer) {
+      await this.resubscribeSharedThreads();
+      if (!this.#sharedInventoryComplete) {
+        throw new DomainError(
+          "THREAD_READ_ONLY",
+          "All subtask states could not be confirmed yet; try archiving again later.",
+          409,
+        );
+      }
+    }
+    const thread = await this.#readAuthorizedThread(normalizedThreadId);
+    if (asString(thread.parentThreadId) !== undefined) {
+      throw new DomainError(
+        "THREAD_READ_ONLY",
+        "Subtasks are managed by their parent task and cannot be archived or restored independently.",
+        409,
+      );
+    }
+    if (
+      archived &&
+      (rawThreadIsActive(thread) || this.#cachedThreadTreeIsActive(normalizedThreadId))
+    ) {
+      throw new DomainError(
+        "THREAD_READ_ONLY",
+        "This task is still running; stop it before archiving.",
+        409,
+      );
+    }
+
+    if (!archived) {
+      const response = asRecord(
+        await this.#gateway.request("thread/unarchive", {
+          threadId: normalizedThreadId,
+        }),
+      );
+      const restoredThread = asRecord(response.thread);
+      if (asString(restoredThread.id) !== normalizedThreadId) {
+        throw new DomainError(
+          "THREAD_NOT_FOUND",
+          "The restored conversation record is invalid",
+          404,
+        );
+      }
+      this.#events?.append(
+        "thread.updated",
+        { archived: false, threadId: normalizedThreadId },
+        { threadId: normalizedThreadId },
+      );
+      this.#archivedThreadIds.delete(normalizedThreadId);
+      return;
+    }
+
+    const archiveIntent =
+      this.#beginArchiveIntent === undefined
+        ? undefined
+        : await this.#beginArchiveIntent(normalizedThreadId, true);
+    if (archiveIntent !== undefined) {
+      const normalizedIntent = normalizeArchiveIntent(archiveIntent);
+      if (
+        normalizedIntent === undefined ||
+        normalizedIntent.threadId !== normalizedThreadId ||
+        normalizedIntent.targetArchived !== true
+      ) {
+        throw new Error("The local archive intent receipt is invalid");
+      }
+      this.#archiveIntents.set(normalizedThreadId, normalizedIntent);
+    }
+    const releasedManagement = await this.#releaseManagedThread(normalizedThreadId);
+    try {
+      await this.#gateway.request("thread/archive", {
+        threadId: normalizedThreadId,
+      });
+    } catch (error) {
+      const recoveryIntent =
+        this.#archiveIntents.get(normalizedThreadId) ??
+        ({
+          desktopNotificationPending: releasedManagement.desktopNotificationPending,
+          managed: releasedManagement.managed,
+          targetArchived: true,
+          threadId: normalizedThreadId,
+        } satisfies ArchiveIntent);
+      this.#restoreArchiveIntentOwnership(recoveryIntent);
+      try {
+        if (this.#settleArchiveIntent !== undefined && archiveIntent !== undefined) {
+          await this.#settleArchiveIntent(normalizedThreadId, false);
+          this.#archiveIntents.delete(normalizedThreadId);
+        } else if (releasedManagement.managed) {
+          await this.#markManaged(
+            normalizedThreadId,
+            releasedManagement.desktopNotificationPending,
+          );
+        }
+      } catch (compensationError) {
+        throw new AggregateError(
+          [error, compensationError],
+          "Archiving failed and the local managed state could not be restored immediately; the recovery intent was retained.",
+        );
+      }
+      throw error;
+    }
+    if (this.#settleArchiveIntent !== undefined && archiveIntent !== undefined) {
+      try {
+        await this.#settleArchiveIntent(normalizedThreadId, true);
+        this.#archiveIntents.delete(normalizedThreadId);
+      } catch {
+        this.#events?.append(
+          "diagnostic",
+          {
+            code: "archived-thread-intent-settle-failed",
+            message:
+              "The conversation was archived; local state cleanup will follow the authoritative archive list when the connection recovers.",
+          },
+          { threadId: normalizedThreadId },
+        );
+      }
+    }
+    this.#forgetArchivedThreadTree(normalizedThreadId);
+    if (this.#protocolClientMethods.has("thread/unsubscribe")) {
+      void this.#gateway
+        .request("thread/unsubscribe", { threadId: normalizedThreadId })
+        .catch(() => undefined);
+    }
+    this.#events?.append(
+      "thread.updated",
+      { archived: true, threadId: normalizedThreadId },
+      { threadId: normalizedThreadId },
+    );
+  }
+
+  async updateThreadSettings(threadId: string, input: ThreadSettingsInput): Promise<void> {
+    await this.#prepareManagedThread(threadId);
+    await this.#requireAuthorizedThreadProjectRoot(threadId);
+
+    const params: Record<string, unknown> = { threadId };
+    const model =
+      input.model === undefined || input.model === null
+        ? input.model
+        : requireNonEmpty(input.model, "model");
+    const effort =
+      input.reasoningEffort === undefined || input.reasoningEffort === null
+        ? input.reasoningEffort
+        : requireNonEmpty(input.reasoningEffort, "reasoning level");
+    if (input.model !== undefined) {
+      params.model = model;
+    }
+    if (input.reasoningEffort !== undefined) {
+      params.effort = effort;
+    }
+    if (input.serviceTier !== undefined) {
+      params.serviceTier =
+        input.serviceTier === null ? null : requireNonEmpty(input.serviceTier, "speed");
+    }
+    if (input.approvalPolicy !== undefined) {
+      if (input.approvalPolicy === null) {
+        params.approvalPolicy = null;
+      } else {
+        const approvalPolicy = requireNonEmpty(input.approvalPolicy, "approval policy");
+        await this.#requireAvailableApprovalPolicy(approvalPolicy);
+        params.approvalPolicy = approvalPolicy;
+      }
+    }
+    if (input.approvalsReviewer !== undefined) {
+      if (input.approvalsReviewer === null) {
+        params.approvalsReviewer = null;
+      } else {
+        const approvalsReviewer = requireNonEmpty(input.approvalsReviewer, "approval reviewer");
+        await this.#requireAvailableApprovalReviewer(approvalsReviewer);
+        params.approvalsReviewer = approvalsReviewer;
+      }
+    }
+    if (input.permissionProfileId !== undefined) {
+      if (input.permissionProfileId === null) {
+        params.permissions = null;
+      } else {
+        const permissionProfileId = requireNonEmpty(input.permissionProfileId, "permissions");
+        await this.#requireAvailablePermissionProfile(threadId, permissionProfileId);
+        params.permissions = permissionProfileId;
+      }
+    }
+    if (input.collaborationMode !== undefined) {
+      const rememberedSettings = this.#runtimeProjectionOptions(threadId);
+      params.collaborationMode =
+        input.collaborationMode === null
+          ? null
+          : await this.#resolveCollaborationSettings(
+              requireNonEmpty(input.collaborationMode, "collaboration mode"),
+              model ??
+                (typeof rememberedSettings.model === "string"
+                  ? rememberedSettings.model
+                  : undefined),
+              effort ??
+                (typeof rememberedSettings.reasoningEffort === "string"
+                  ? rememberedSettings.reasoningEffort
+                  : undefined),
+            );
+    }
+    if (Object.keys(params).length === 1) {
+      return;
+    }
+
+    try {
+      await this.#gateway.request("thread/settings/update", params);
+    } catch {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "This Codex version does not support this set of next-turn settings; the draft and existing settings were not changed.",
+        409,
+      );
+    }
+    const acceptedSettings: Record<string, unknown> = {
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+      ...(input.permissionProfileId === undefined
+        ? {}
+        : { permissionProfileId: input.permissionProfileId }),
+      ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+      ...(input.approvalsReviewer === undefined
+        ? {}
+        : { approvalsReviewer: input.approvalsReviewer }),
+      ...(input.collaborationMode === undefined
+        ? {}
+        : { collaborationMode: input.collaborationMode }),
+    };
+    this.#rememberPendingRuntimeSettings(threadId, acceptedSettings);
+    this.#rememberRuntimeSettings(threadId, acceptedSettings);
+  }
+
+  async getThreadGoal(threadId: string): Promise<ThreadGoal | undefined> {
+    await this.#prepareManagedThread(threadId);
+    let response: Record<string, unknown>;
+    try {
+      response = asRecord(await this.#gateway.request("thread/goal/get", { threadId }));
+    } catch {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current Codex version does not support goals yet.",
+        409,
+      );
+    }
+    if (response.goal === null || response.goal === undefined) {
+      return undefined;
+    }
+    return projectThreadGoal(response.goal, threadId);
+  }
+
+  async setThreadGoal(threadId: string, input: SetThreadGoalInput): Promise<void> {
+    await this.#prepareManagedThread(threadId);
+    await this.#requireAuthorizedThreadProjectRoot(threadId);
+    const objective =
+      input.objective === undefined ? undefined : requireNonEmpty(input.objective, "objective");
+    const status = input.status;
+    if (status !== undefined && !isThreadGoalStatus(status)) {
+      throw new DomainError("INVALID_INPUT", "Goal status is invalid", 400);
+    }
+    if (
+      input.tokenBudget !== undefined &&
+      (!Number.isSafeInteger(input.tokenBudget) || input.tokenBudget <= 0)
+    ) {
+      throw new DomainError("INVALID_INPUT", "Goal limit must be a positive integer", 400);
+    }
+    if (objective === undefined && status === undefined && input.tokenBudget === undefined) {
+      throw new DomainError("INVALID_INPUT", "Goal changes cannot be empty", 400);
+    }
+    try {
+      await this.#gateway.request("thread/goal/set", {
+        threadId,
+        ...(objective === undefined ? {} : { objective }),
+        ...(status === undefined ? {} : { status }),
+        ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
+      });
+    } catch {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current Codex version does not support setting goals; existing goals were not changed.",
+        409,
+      );
+    }
+  }
+
+  async clearThreadGoal(threadId: string): Promise<void> {
+    await this.#prepareManagedThread(threadId);
+    await this.#requireAuthorizedThreadProjectRoot(threadId);
+    try {
+      await this.#gateway.request("thread/goal/clear", { threadId });
+    } catch {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The current Codex version does not support clearing goals; existing goals were not changed.",
+        409,
+      );
+    }
+  }
+
+  async compactThread(threadId: string): Promise<void> {
+    await this.#prepareManagedThread(threadId);
+    const reservation = this.#reserveCompaction(threadId);
+    try {
+      await this.#refreshRestoredThread(threadId);
+      this.#requireDirectInput(threadId);
+      this.#assertTurnControlAvailable(threadId);
+      await this.#requireAuthorizedThreadProjectRoot(threadId);
+      const state = this.#compactingThreads.get(threadId);
+      if (state !== reservation || state.phase !== "reserving") {
+        throw new DomainError(
+          "TURN_MISMATCH",
+          "Context compaction has finished; refresh and try again",
+          409,
+        );
+      }
+      state.phase = "requested";
+      await this.#gateway.request("thread/compact/start", { threadId });
+    } catch (error) {
+      if (this.#compactingThreads.get(threadId) === reservation) {
+        this.#compactingThreads.delete(threadId);
+      }
+      throw error;
+    }
+  }
+
+  async startTurn(threadId: string, input: SendTurnInput): Promise<TurnCommandResult> {
+    await this.#prepareManagedThread(threadId);
+    const prompt = requireNonEmpty(input.prompt, "message");
+    this.#reserveTurnStart(threadId);
+    let response: Record<string, unknown>;
+    try {
+      await this.#refreshRestoredThread(threadId);
+      this.#requireDirectInput(threadId);
+      this.#assertTurnControlAvailable(threadId);
+      const projectId = await this.#requireAuthorizedThreadProjectRoot(threadId);
+      const turnInput = await this.#resolveTurnInput(prompt, input.attachments, projectId);
+      if (input.permissionProfileId !== undefined) {
+        await this.#requireAvailablePermissionProfile(threadId, input.permissionProfileId);
+      }
+      if (input.approvalsReviewer !== undefined) {
+        await this.#requireAvailableApprovalReviewer(input.approvalsReviewer);
+      }
+      if (input.approvalPolicy !== undefined) {
+        await this.#requireAvailableApprovalPolicy(input.approvalPolicy);
+      }
+      const rememberedSettings = this.#runtimeProjectionOptions(threadId);
+      const collaborationMode =
+        input.collaborationMode === undefined
+          ? undefined
+          : await this.#resolveCollaborationSettings(
+              input.collaborationMode,
+              input.model ??
+                (typeof rememberedSettings.model === "string"
+                  ? rememberedSettings.model
+                  : undefined),
+              input.reasoningEffort ??
+                (typeof rememberedSettings.reasoningEffort === "string"
+                  ? rememberedSettings.reasoningEffort
+                  : undefined),
+            );
+      response = asRecord(
+        await this.#gateway.request("turn/start", {
+          threadId,
+          input: turnInput,
+          ...(input.clientUserMessageId === undefined
+            ? {}
+            : { clientUserMessageId: input.clientUserMessageId }),
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.reasoningEffort === undefined ? {} : { effort: input.reasoningEffort }),
+          ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+          ...(input.permissionProfileId === undefined
+            ? {}
+            : { permissions: input.permissionProfileId }),
+          ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+          ...(input.approvalsReviewer === undefined
+            ? {}
+            : { approvalsReviewer: input.approvalsReviewer }),
+          ...(collaborationMode === undefined ? {} : { collaborationMode }),
+        }),
+      );
+    } catch (error) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      this.#turnStartTerminalStatusesBeforeResponse.delete(threadId);
+      if (isBrokerTurnStartConflict(error)) {
+        throw new DomainError(
+          "TURN_MISMATCH",
+          "Codex is still finishing the current response; the message was not sent. Try again later.",
+          409,
+        );
+      }
+      throw error;
+    } finally {
+      this.#pendingTurnStarts.delete(threadId);
+    }
+    const turnId = asString(asRecord(response.turn).id);
+    if (!turnId) {
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      this.#turnStartTerminalStatusesBeforeResponse.delete(threadId);
+      throw new DomainError("TURN_MISMATCH", "Codex did not start a response", 502);
+    }
+    const terminalBeforeResponse = this.#consumeTurnTerminalBeforeResponse(threadId, turnId);
+    this.#recentlyCompletedCompactionTurns.delete(threadId);
+    if (!terminalBeforeResponse.observed) {
+      this.#activeTurns.set(threadId, turnId);
+      this.#orphanedActiveTurns.delete(threadId);
+    }
+    this.#rememberRuntimeSettings(threadId, {
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+      ...(input.permissionProfileId === undefined
+        ? {}
+        : { permissionProfileId: input.permissionProfileId }),
+      ...(input.approvalPolicy === undefined ? {} : { approvalPolicy: input.approvalPolicy }),
+      ...(input.approvalsReviewer === undefined
+        ? {}
+        : { approvalsReviewer: input.approvalsReviewer }),
+      ...(input.collaborationMode === undefined
+        ? {}
+        : { collaborationMode: input.collaborationMode }),
+    });
+    return {
+      state: terminalBeforeResponse.observed ? "idle" : "running",
+      threadId,
+      turnId,
+    };
+  }
+
+  async reconcileClientUserMessage(
+    threadId: string,
+    clientUserMessageId: string,
+  ): Promise<
+    | {
+        lifecycle: "active" | "completed" | "failed" | "unknown";
+        state: "accepted";
+        turnId?: string;
+      }
+    | { state: "active" | "absent-idle" | "unknown" }
+  > {
+    await this.#prepareManagedThread(threadId);
+    const normalizedClientId = requireNonEmpty(clientUserMessageId, "message identifier");
+    if (normalizedClientId.length > 512) {
+      throw new DomainError("INVALID_INPUT", "Client message identifier is invalid", 400);
+    }
+    let response: Record<string, unknown>;
+    try {
+      response = await this.#readThreadForDisplay(threadId, true);
+    } catch {
+      return { state: "unknown" };
+    }
+    const thread = asRecord(response.thread);
+    const turns = asRecordArray(thread.turns);
+    for (const turn of turns) {
+      const matched = asRecordArray(turn.items).some(
+        (item) => item.type === "userMessage" && item.clientId === normalizedClientId,
+      );
+      if (matched) {
+        const turnId = asString(turn.id);
+        const status = asString(turn.status);
+        const lifecycle =
+          status === "inProgress"
+            ? "active"
+            : status === "completed"
+              ? "completed"
+              : status === "cancelled" || status === "failed" || status === "interrupted"
+                ? "failed"
+                : "unknown";
+        return {
+          lifecycle,
+          state: "accepted",
+          ...(turnId === undefined ? {} : { turnId }),
+        };
+      }
+    }
+    const status = asString(asRecord(thread.status).type) ?? asString(thread.status);
+    if (status === "active" || turns.some((turn) => turn.status === "inProgress")) {
+      return { state: "active" };
+    }
+    if (status === "idle" || status === "systemError") {
+      return { state: "absent-idle" };
+    }
+    return { state: "unknown" };
+  }
+
+  async #readAuthorizedThread(threadId: string): Promise<Record<string, unknown>> {
+    await this.#refreshProjectRegistry();
+    const thread = this.#sharedAppServer
+      ? this.#requireSharedThreadMetadata(threadId)
+      : asRecord(
+          asRecord(await this.#gateway.request("thread/read", { includeTurns: false, threadId }))
+            .thread,
+        );
+    if (asString(thread.id) !== threadId) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    const cwd = thread.cwd;
+    const projectId = this.projects.findIdByCwd(cwd);
+    if (projectId) {
+      await this.#requireAuthorizedProjectRoot(projectId);
+      return thread;
+    }
+    if (!this.#isGeneralConversationRoot(cwd)) {
+      throw new DomainError(
+        "PROJECT_NOT_AUTHORIZED",
+        "This conversation's project is not registered on the local computer; the next turn cannot start",
+        403,
+      );
+    }
+    return thread;
+  }
+
+  async #requireAuthorizedThreadProjectRoot(threadId: string): Promise<string | undefined> {
+    const thread = await this.#readAuthorizedThread(threadId);
+    return this.projects.findIdByCwd(thread.cwd);
+  }
+
+  async steerTurn(
+    threadId: string,
+    turnId: string,
+    input: SteerTurnInput | string,
+  ): Promise<TurnCommandResult> {
+    await this.#prepareManagedThread(threadId);
+    this.#assertNotCompacting(threadId);
+    await this.#refreshRestoredThread(threadId);
+    this.#requireDirectInput(threadId);
+    this.#assertTurnControlAvailable(threadId);
+    const steerInput = typeof input === "string" ? { prompt: input } : input;
+    const projectId = await this.#requireAuthorizedThreadProjectRoot(threadId);
+    const prompt = requireNonEmpty(steerInput.prompt, "follow-up message");
+    const turnInput = await this.#resolveTurnInput(prompt, steerInput.attachments, projectId);
+    const activeTurn = this.#activeTurns.get(threadId);
+    if (activeTurn !== turnId) {
+      throw new DomainError("TURN_MISMATCH", "This response has ended or has been replaced", 409);
+    }
+    const response = asRecord(
+      await this.#gateway.request("turn/steer", {
+        expectedTurnId: turnId,
+        input: turnInput,
+        threadId,
+      }),
+    );
+    return {
+      state: "running",
+      threadId,
+      turnId: asString(response.turnId) ?? turnId,
+    };
+  }
+
+  async interruptTurn(threadId: string, turnId: string): Promise<TurnCommandResult> {
+    await this.#prepareManagedThread(threadId);
+    this.#assertNotCompacting(threadId);
+    await this.#refreshRestoredThread(threadId);
+    this.#requireDirectInput(threadId);
+    this.#assertTurnControlAvailable(threadId);
+    if (this.#activeTurns.get(threadId) !== turnId) {
+      throw new DomainError("TURN_MISMATCH", "This response has ended or has been replaced", 409);
+    }
+    await this.#gateway.request("turn/interrupt", { threadId, turnId });
+    // The RPC only requests interruption. Keep the active turn authoritative
+    // until app-server emits its terminal lifecycle event; otherwise another
+    // browser can race a new turn into work that is still stopping.
+    return { state: "running", threadId, turnId };
+  }
+
+  async listSubagents(
+    threadId: string,
+    options: { cursor?: string; limit?: number } = {},
+  ): Promise<SubagentPage> {
+    const cursorState = decodeSubagentCursor(options.cursor);
+    const continuing = options.cursor !== undefined;
+    let collections: {
+      archived: SubagentStreamCollection;
+      current: SubagentStreamCollection;
+    };
+    let ancestorFilterTrusted = true;
+    collections = await this.#collectSubagentStreams(
+      {
+        ancestorThreadId: threadId,
+      },
+      options,
+      cursorState,
+      continuing,
+    );
+    if (subagentCollectionFailed(collections)) {
+      ancestorFilterTrusted = false;
+      const fallback = await this.#collectSubagentStreams({}, options, cursorState, continuing);
+      collections = {
+        archived: preferCompletedSubagentCollection(collections.archived, fallback.archived),
+        current: preferCompletedSubagentCollection(collections.current, fallback.current),
+      };
+    }
+    const snapshotDiscovery = !continuing
+      ? await this.#discoverSnapshotSubagents(threadId)
+      : emptySubagentSnapshotDiscovery();
+    const visibleThreads = [
+      ...collections.current.threads,
+      ...collections.archived.threads,
+      ...snapshotDiscovery.threads,
+    ];
+    const byId = new Map(
+      visibleThreads
+        .map((thread) => [asString(thread.id), thread] as const)
+        .filter((entry): entry is [string, Record<string, unknown>] => entry[0] !== undefined),
+    );
+    await this.#hydrateSubagentAncestors(threadId, visibleThreads, byId);
+    const visibleById = new Map(
+      visibleThreads
+        .map((thread) => [asString(thread.id), thread] as const)
+        .filter((entry): entry is [string, Record<string, unknown>] => entry[0] !== undefined),
+    );
+    const data = [...visibleById.values()]
+      .filter(
+        (thread) =>
+          (ancestorFilterTrusted && asString(thread.id) !== threadId) ||
+          isDescendantOf(thread, threadId, byId),
+      )
+      .map((thread) => {
+        const id = asString(thread.id) ?? "";
+        const parentThreadId = asString(thread.parentThreadId) ?? threadId;
+        const summary = projectThreadSummary(thread, {
+          managed: this.#isControllableThread(id),
+        });
+        return {
+          depth: calculateDepth(thread, threadId, byId),
+          isDirectlyControllable: this.#isControllableThread(id),
+          parentThreadId,
+          state: summary.state,
+          threadId: id,
+          title: snapshotDiscovery.labels.get(id) ?? summary.title,
+          updatedAt: summary.updatedAt,
+        };
+      });
+    const nextCursor = encodeSubagentCursor({
+      ...(collections.current.nextCursor === undefined
+        ? {}
+        : { current: collections.current.nextCursor }),
+      ...(collections.archived.nextCursor === undefined
+        ? {}
+        : { archived: collections.archived.nextCursor }),
+    });
+    return {
+      data,
+      historyIntegrity: subagentHistoryIntegrity({
+        collections,
+        continuing,
+        data,
+        snapshotDiscovery,
+      }),
+      ...(nextCursor === undefined ? {} : { nextCursor }),
+    };
+  }
+
+  async #hydrateSubagentAncestors(
+    rootThreadId: string,
+    visibleThreads: readonly Record<string, unknown>[],
+    byId: Map<string, Record<string, unknown>>,
+  ): Promise<void> {
+    const pending = new Set<string>();
+    const attempted = new Set<string>();
+    for (const thread of visibleThreads) {
+      const parentThreadId = asString(thread.parentThreadId);
+      if (parentThreadId && parentThreadId !== rootThreadId && !byId.has(parentThreadId)) {
+        pending.add(parentThreadId);
+      }
+    }
+
+    while (pending.size > 0 && attempted.size < MAX_SUBAGENT_ANCESTOR_READS) {
+      const batch = [...pending]
+        .filter((threadId) => !attempted.has(threadId))
+        .slice(0, SUBAGENT_ANCESTOR_READ_CONCURRENCY);
+      if (batch.length === 0) {
+        break;
+      }
+      for (const threadId of batch) {
+        pending.delete(threadId);
+        attempted.add(threadId);
+      }
+      const ancestors = await Promise.all(
+        batch.map(async (threadId) => {
+          try {
+            const response = asRecord(
+              await this.#gateway.request("thread/read", {
+                includeTurns: false,
+                threadId,
+              }),
+            );
+            const thread = asRecord(response.thread);
+            return asString(thread.id) === threadId ? thread : undefined;
+          } catch {
+            return undefined;
+          }
+        }),
+      );
+      for (const ancestor of ancestors) {
+        if (!ancestor) {
+          continue;
+        }
+        const ancestorId = asString(ancestor.id);
+        if (!ancestorId) {
+          continue;
+        }
+        byId.set(ancestorId, ancestor);
+        const parentThreadId = asString(ancestor.parentThreadId);
+        if (
+          parentThreadId &&
+          parentThreadId !== rootThreadId &&
+          !byId.has(parentThreadId) &&
+          !attempted.has(parentThreadId)
+        ) {
+          pending.add(parentThreadId);
+        }
+      }
+    }
+  }
+
+  async #discoverSnapshotSubagents(rootThreadId: string): Promise<SubagentSnapshotDiscovery> {
+    const labels = new Map<string, string>();
+    const threads: Record<string, unknown>[] = [];
+    const referencedThreadIds = new Set<string>();
+    const seen = new Set<string>([rootThreadId]);
+    const frontier = [rootThreadId];
+    let historyIncomplete = false;
+    let readCount = 0;
+    let readDiagnosticMissing = false;
+    let readFailureCount = 0;
+    let traversalTruncated = false;
+
+    for (let batchIndex = 0; batchIndex < 16 && frontier.length > 0; batchIndex += 1) {
+      const batch = frontier.splice(0, 32);
+      const responses = await Promise.all(
+        batch.map(async (threadId) => {
+          try {
+            const response = await this.#readThreadForDisplay(threadId, true);
+            const thread = asRecord(response.thread);
+            return {
+              diagnostic: threadHistoryReadDiagnostic(response),
+              thread: asString(thread.id) ? thread : undefined,
+              threadId,
+            };
+          } catch {
+            return { thread: undefined, threadId };
+          }
+        }),
+      );
+
+      const next: string[] = [];
+      for (const response of responses) {
+        const thread = response.thread;
+        if (!thread) {
+          readFailureCount += 1;
+          continue;
+        }
+        readCount += 1;
+        if (response.diagnostic === undefined) {
+          readDiagnosticMissing = true;
+        } else if (response.diagnostic.status === "more-available") {
+          historyIncomplete = true;
+        }
+        const id = asString(thread.id);
+        if (id && id !== rootThreadId) {
+          threads.push(thread);
+        }
+        for (const activity of subagentActivities(thread)) {
+          referencedThreadIds.add(activity.threadId);
+          if (activity.label) {
+            labels.set(activity.threadId, activity.label);
+          }
+          if (!seen.has(activity.threadId) && seen.size < 500) {
+            seen.add(activity.threadId);
+            next.push(activity.threadId);
+          } else if (!seen.has(activity.threadId)) {
+            traversalTruncated = true;
+          }
+        }
+      }
+      frontier.push(...next);
+    }
+    if (frontier.length > 0) {
+      traversalTruncated = true;
+    }
+
+    return {
+      historyIncomplete,
+      labels,
+      readCount,
+      readDiagnosticMissing,
+      readFailureCount,
+      referencedThreadIds,
+      threads,
+      traversalTruncated,
+    };
+  }
+
+  async #collectSubagentStreams(
+    filters: Record<string, unknown>,
+    options: { cursor?: string; limit?: number },
+    cursorState: SubagentCursorState,
+    continuing: boolean,
+  ): Promise<{
+    archived: SubagentStreamCollection;
+    current: SubagentStreamCollection;
+  }> {
+    const requestedLimit = normalizeSubagentLimit(options.limit);
+    const notRequested = (): SubagentStreamCollection => ({
+      requestedLimit,
+      status: "not-requested",
+      threads: [],
+    });
+    const [current, archived] = await Promise.all([
+      continuing && cursorState.current === undefined
+        ? Promise.resolve(notRequested())
+        : this.#collectSubagentPages(
+            { ...filters, archived: false },
+            {
+              ...(cursorState.current === undefined ? {} : { cursor: cursorState.current }),
+              ...(options.limit === undefined ? {} : { limit: options.limit }),
+            },
+          ),
+      continuing && cursorState.archived === undefined
+        ? Promise.resolve(notRequested())
+        : this.#collectSubagentPages(
+            { ...filters, archived: true },
+            {
+              ...(cursorState.archived === undefined ? {} : { cursor: cursorState.archived }),
+              ...(options.limit === undefined ? {} : { limit: options.limit }),
+            },
+          ),
+    ]);
+    return { archived, current };
+  }
+
+  async #collectSubagentPages(
+    filters: Record<string, unknown>,
+    options: { cursor?: string; limit?: number },
+  ): Promise<SubagentStreamCollection> {
+    const requestedLimit = normalizeSubagentLimit(options.limit);
+    try {
+      const response = asRecord(
+        await this.#gateway.request("thread/list", {
+          ...filters,
+          ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+          limit: requestedLimit,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+        }),
+      );
+      const nextCursor = asString(response.nextCursor);
+      const threads = asRecordArray(response.data);
+      if (nextCursor !== undefined && nextCursor === options.cursor) {
+        return {
+          nextCursor,
+          requestedLimit,
+          status: "failed",
+          threads,
+        };
+      }
+      return {
+        requestedLimit,
+        status: nextCursor === undefined ? "exhausted" : "more-available",
+        threads,
+        ...(nextCursor === undefined ? {} : { nextCursor }),
+      };
+    } catch {
+      return {
+        requestedLimit,
+        status: "failed",
+        threads: [],
+        ...(options.cursor === undefined ? {} : { nextCursor: options.cursor }),
+      };
+    }
+  }
+
+  handleNotification(notification: AppServerNotificationLike): void {
+    const params = asRecord(notification.params);
+    const notificationThread = asRecord(params.thread);
+    const threadId = asString(params.threadId) ?? asString(notificationThread.id);
+    if (threadId && notification.method === "thread/name/updated") {
+      const threadName = asString(params.threadName);
+      const cached = this.#sharedThreadSnapshots.get(threadId);
+      if (threadName !== undefined && cached !== undefined) {
+        this.#rememberSharedThreadSnapshot({ ...cached, name: threadName });
+        this.#publishTopLevelSnapshotsFor(new Set([threadId]));
+      }
+    }
+    if (threadId && notification.method === "thread/archived") {
+      const wasManaged = this.#managedThreads.has(threadId);
+      this.#forgetArchivedThreadTree(threadId);
+      if (wasManaged || this.#archiveIntents.has(threadId)) {
+        void this.#cleanupDesktopArchivedThread(threadId);
+      }
+    } else if (threadId && notification.method === "thread/unarchived") {
+      this.#archivedThreadIds.delete(threadId);
+    }
+    if (
+      threadId &&
+      this.#sharedAppServer &&
+      isSharedThreadLifecycleNotification(notification.method)
+    ) {
+      if (this.#applySharedThreadLifecycleNotification(threadId, notification)) {
+        this.#publishTopLevelSnapshotsFor(new Set([threadId]));
+        void this.#promoteSharedTopLevelThread(threadId)
+          .then(() => {
+            this.#publishTopLevelSnapshotsFor(new Set([threadId]));
+          })
+          .catch(() => {
+            // A later loaded-thread census retries root promotion. Until then
+            // the snapshot remains visible without unsafe controls.
+          });
+      } else {
+        void this.#hydrateSharedThreadLifecycleNotification(threadId, notification).catch(() => {
+          // A lifecycle notification may beat the rollout becoming readable.
+          // The next loaded-thread census or notification retries hydration.
+        });
+      }
+    }
+    if (threadId && this.#sharedAppServer && notification.method === "thread/started") {
+      this.#rememberRuntimeSettings(threadId, notificationThread);
+      void this.#hydrateStartedThreadSnapshot(threadId).catch(() => {
+        // A brand-new thread is announced before its rollout is durable. The
+        // bounded retry lives in #ensureSharedThread. Until it succeeds, the
+        // broadcast shell remains a read-only discovery row.
+      });
+    }
+    if (
+      threadId &&
+      this.#isControllableThread(threadId) &&
+      notification.method === "item/started" &&
+      asString(asRecord(params.item).type) === "contextCompaction"
+    ) {
+      const turnId = asString(params.turnId);
+      if (turnId) {
+        const itemId = asString(asRecord(params.item).id);
+        const existing = this.#compactingThreads.get(threadId);
+        if (!existing || existing.phase === "reserving") {
+          this.#compactingThreads.set(threadId, {
+            ...(itemId === undefined ? {} : { itemId }),
+            phase: "observed",
+            turnId,
+          });
+        } else if (existing.phase === "requested" && existing.turnId === undefined) {
+          existing.turnId = turnId;
+        }
+      }
+    }
+    if (
+      threadId &&
+      (notification.method === "item/started" || notification.method === "item/completed")
+    ) {
+      const compaction = this.#compactingThreads.get(threadId);
+      const item = asRecord(params.item);
+      const itemId = asString(item.id);
+      const itemType = asString(item.type);
+      const turnId = asString(params.turnId);
+      const completedObservedCompaction =
+        notification.method === "item/completed" &&
+        itemType === "contextCompaction" &&
+        (compaction?.itemId === undefined || compaction.itemId === itemId);
+      const movedPastObservedCompaction =
+        notification.method === "item/started" &&
+        itemType !== undefined &&
+        itemType !== "contextCompaction";
+      if (
+        compaction?.phase === "observed" &&
+        compaction.turnId === turnId &&
+        (completedObservedCompaction || movedPastObservedCompaction)
+      ) {
+        // Automatic compaction can run inside a still-active turn. Some
+        // app-server versions omit item/completed for that internal item, but
+        // the next item/started is authoritative proof that compaction itself
+        // ended. Keep the turn active so steer/interrupt resume immediately.
+        this.#compactingThreads.delete(threadId);
+      }
+    }
+    if (
+      threadId &&
+      notification.method === "thread/status/changed" &&
+      isTerminalThreadStatus(params.status)
+    ) {
+      const activeTurnId = this.#activeTurns.get(threadId);
+      if (activeTurnId && this.#pendingTurnStarts.has(threadId)) {
+        this.#turnStartTerminalStatusesBeforeResponse.set(threadId, {
+          status: params.status,
+          turnId: activeTurnId,
+        });
+      }
+      const compaction = this.#compactingThreads.get(threadId);
+      if (compaction?.turnId) {
+        this.#recentlyCompletedCompactionTurns.set(threadId, compaction.turnId);
+      }
+      this.#compactingThreads.delete(threadId);
+      this.#activeTurns.delete(threadId);
+      this.#orphanedActiveTurns.delete(threadId);
+    }
+    if (threadId && notification.method === "turn/started") {
+      const turnId = asString(asRecord(params.turn).id);
+      if (turnId) {
+        const compaction = this.#compactingThreads.get(threadId);
+        if (compaction?.phase === "requested") {
+          compaction.turnId = turnId;
+        } else if (this.#isControllableThread(threadId) || this.#pendingTurnStarts.has(threadId)) {
+          this.#recentlyCompletedCompactionTurns.delete(threadId);
+          this.#activeTurns.set(threadId, turnId);
+          this.#orphanedActiveTurns.delete(threadId);
+        }
+      }
+    }
+    if (threadId && notification.method === "turn/completed") {
+      const completedTurnId = asString(asRecord(params.turn).id);
+      if (this.#pendingTurnStarts.has(threadId) && completedTurnId) {
+        const completedTurnIds =
+          this.#turnStartsCompletedBeforeResponse.get(threadId) ?? new Set<string>();
+        completedTurnIds.add(completedTurnId);
+        this.#turnStartsCompletedBeforeResponse.set(threadId, completedTurnIds);
+      }
+      const compaction = this.#compactingThreads.get(threadId);
+      if (compaction?.turnId && compaction.turnId === completedTurnId) {
+        this.#compactingThreads.delete(threadId);
+        this.#recentlyCompletedCompactionTurns.set(threadId, completedTurnId);
+      }
+      const activeTurnId = this.#activeTurns.get(threadId);
+      if (completedTurnId === undefined || activeTurnId === completedTurnId) {
+        this.#activeTurns.delete(threadId);
+        this.#orphanedActiveTurns.delete(threadId);
+      }
+      if (this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+        void this.reconcilePendingDesktopNotifications();
+      }
+    }
+    if (threadId && notification.method === "error" && params.willRetry === false) {
+      const failedTurnId = asString(params.turnId);
+      const activeTurnId = this.#activeTurns.get(threadId);
+      if (failedTurnId !== undefined && activeTurnId === failedTurnId) {
+        this.#activeTurns.delete(threadId);
+        this.#orphanedActiveTurns.delete(threadId);
+      }
+      const compaction = this.#compactingThreads.get(threadId);
+      if (
+        compaction !== undefined &&
+        (compaction.turnId === undefined ||
+          failedTurnId === undefined ||
+          compaction.turnId === failedTurnId)
+      ) {
+        this.#compactingThreads.delete(threadId);
+        if (compaction.turnId) {
+          this.#recentlyCompletedCompactionTurns.set(threadId, compaction.turnId);
+        }
+      }
+    }
+    if (threadId && notification.method === "thread/settings/updated") {
+      const settings = asRecord(params.threadSettings);
+      this.#pendingRuntimeSettings.delete(threadId);
+      this.#rememberRuntimeSettings(threadId, settings);
+      this.#rememberPendingRuntimeSettings(threadId, settings);
+    }
+    if (threadId && notification.method === "model/rerouted") {
+      const toModel = asString(params.toModel);
+      if (toModel) {
+        this.#pendingRuntimeSettings.delete(threadId);
+        this.#rememberRuntimeSettings(threadId, { model: toModel });
+        this.#rememberPendingRuntimeSettings(threadId, { model: toModel });
+      }
+    }
+    if (threadId && notification.method === "thread/tokenUsage/updated") {
+      this.#rememberUsageContext(threadId, params.tokenUsage);
+    }
+    if (!this.#events) {
+      return;
+    }
+    for (const event of projectAppServerNotification(notification)) {
+      if (
+        this.#sharedAppServer &&
+        event.type === "thread.snapshot" &&
+        !this.#isTopLevelThreadSnapshot(event.payload)
+      ) {
+        continue;
+      }
+      this.#events.append(event.type, event.payload, {
+        ...(event.threadId === undefined ? {} : { threadId: event.threadId }),
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+      });
+    }
+  }
+
+  isManagedThread(threadId: string): boolean {
+    return this.#isControllableThread(threadId);
+  }
+
+  handleBackendRestart(): void {
+    this.#activeTurns.clear();
+    this.#compactingThreads.clear();
+    this.#directInputThreads.clear();
+    this.#orphanedActiveTurns.clear();
+    this.#pendingTurnStarts.clear();
+    this.#turnStartsCompletedBeforeResponse.clear();
+    this.#turnStartTerminalStatusesBeforeResponse.clear();
+    this.#recentlyCompletedCompactionTurns.clear();
+    this.#loadedThreadIds.clear();
+    this.#sharedSubscribedThreads.clear();
+    this.#sharedSubscriptionPromises.clear();
+    this.#sharedInventoryRefreshPromise = undefined;
+    this.#sharedInventoryComplete = false;
+    this.#managedArchiveCensusPending = true;
+    this.#reconciledCurrentThreadIds.clear();
+    for (const threadId of this.#threadsAwaitingInitialTurnCompletion) {
+      this.#restoredPendingDesktopNotifications.add(threadId);
+    }
+    for (const threadId of this.#managedThreads) {
+      this.#restoredThreadsNeedingRefresh.add(threadId);
+    }
+  }
+
+  async #markManaged(threadId: string, desktopNotificationPending: boolean): Promise<void> {
+    const alreadyManaged = this.#managedThreads.has(threadId);
+    this.#managedThreads.add(threadId);
+    try {
+      await this.#persistManagedThread?.(threadId, { desktopNotificationPending });
+      if (desktopNotificationPending) {
+        this.#threadsAwaitingInitialTurnCompletion.add(threadId);
+      }
+      this.#restoredThreadsNeedingRefresh.delete(threadId);
+    } catch (error) {
+      if (!alreadyManaged) {
+        this.#managedThreads.delete(threadId);
+      }
+      throw error;
+    }
+  }
+
+  async #releaseManagedThread(
+    threadId: string,
+  ): Promise<{ desktopNotificationPending: boolean; managed: boolean }> {
+    const managed = this.#managedThreads.has(threadId);
+    const desktopNotificationPending = this.#threadsAwaitingInitialTurnCompletion.has(threadId);
+    if (!managed) {
+      return { desktopNotificationPending, managed: false };
+    }
+    await this.#unpersistManagedThread?.(threadId);
+    this.#managedThreads.delete(threadId);
+    this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+    this.#restoredPendingDesktopNotifications.delete(threadId);
+    this.#restoredThreadsNeedingRefresh.delete(threadId);
+    return { desktopNotificationPending, managed: true };
+  }
+
+  #restoreArchiveIntentOwnership(intent: ArchiveIntent): void {
+    if (intent.managed) {
+      this.#managedThreads.add(intent.threadId);
+      this.#restoredThreadsNeedingRefresh.add(intent.threadId);
+    } else {
+      this.#managedThreads.delete(intent.threadId);
+      this.#restoredThreadsNeedingRefresh.delete(intent.threadId);
+    }
+    if (intent.managed && intent.desktopNotificationPending) {
+      this.#threadsAwaitingInitialTurnCompletion.add(intent.threadId);
+      this.#restoredPendingDesktopNotifications.add(intent.threadId);
+    } else {
+      this.#threadsAwaitingInitialTurnCompletion.delete(intent.threadId);
+      this.#restoredPendingDesktopNotifications.delete(intent.threadId);
+    }
+  }
+
+  #cleanupDesktopArchivedThread(threadId: string): Promise<void> {
+    const existing = this.#archiveCleanupAttempts.get(threadId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const attempt = this.#runArchiveMutation(threadId, async () => {
+      let lastError: unknown;
+      for (const delayMs of this.#archiveCleanupRetryDelaysMs) {
+        if (delayMs > 0) {
+          await delay(delayMs);
+        }
+        try {
+          let intent = this.#archiveIntents.get(threadId);
+          if (intent === undefined && this.#beginArchiveIntent !== undefined) {
+            const created = normalizeArchiveIntent(await this.#beginArchiveIntent(threadId, true));
+            if (
+              created === undefined ||
+              created.threadId !== threadId ||
+              created.targetArchived !== true
+            ) {
+              throw new Error("The local archive intent receipt is invalid");
+            }
+            intent = created;
+            this.#archiveIntents.set(threadId, created);
+          }
+          await this.#unpersistManagedThread?.(threadId);
+          if (intent !== undefined && this.#settleArchiveIntent !== undefined) {
+            await this.#settleArchiveIntent(threadId, true);
+          }
+          this.#archiveIntents.delete(threadId);
+          this.#forgetArchivedThreadTree(threadId);
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      this.#events?.append(
+        "diagnostic",
+        {
+          code: "archived-thread-state-persist-failed",
+          message: this.#archiveIntents.has(threadId)
+            ? "The conversation was archived; local cleanup completed bounded retries and will continue following the authoritative list when the connection recovers."
+            : "The conversation was archived, but local managed-state cleanup still failed after bounded retries; refresh later.",
+          ...(lastError instanceof Error ? { reason: lastError.name } : {}),
+        },
+        { threadId },
+      );
+    });
+    this.#archiveCleanupAttempts.set(threadId, attempt);
+    void attempt.finally(() => {
+      if (this.#archiveCleanupAttempts.get(threadId) === attempt) {
+        this.#archiveCleanupAttempts.delete(threadId);
+      }
+    });
+    return attempt;
+  }
+
+  #runArchiveMutation<T>(threadId: string, mutation: () => Promise<T>): Promise<T> {
+    const previous = this.#archiveMutationTails.get(threadId) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(mutation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#archiveMutationTails.set(threadId, tail);
+    return result.finally(() => {
+      if (this.#archiveMutationTails.get(threadId) === tail) {
+        this.#archiveMutationTails.delete(threadId);
+      }
+    });
+  }
+
+  async #reconcileArchiveIntentsAndPinnedThreads(): Promise<void> {
+    await this.#refreshPinnedThreadIds();
+    const includeManagedCensus =
+      this.#managedArchiveCensusPending && this.#settleArchiveIntent !== undefined;
+    const unresolvedPinnedThreadIds = [...this.#pinnedThreadRanks.keys()].filter(
+      (threadId) =>
+        !this.#archivedThreadIds.has(threadId) && !this.#reconciledCurrentThreadIds.has(threadId),
+    );
+    const targetThreadIds = new Set([
+      ...this.#archiveIntents.keys(),
+      ...unresolvedPinnedThreadIds,
+      ...(includeManagedCensus ? this.#managedThreads : []),
+    ]);
+    if (targetThreadIds.size === 0) {
+      if (includeManagedCensus) {
+        this.#managedArchiveCensusPending = false;
+      }
+      return;
+    }
+    const currentThreadIds = new Set<string>();
+    const archivedThreadIds = new Set<string>();
+    for (const threadId of targetThreadIds) {
+      this.#reconciledCurrentThreadIds.delete(threadId);
+    }
+    let currentCursor: string | undefined;
+    let archivedCursor: string | undefined;
+    let currentDone = false;
+    let archivedDone = false;
+    try {
+      for (let page = 0; page < MAX_ARCHIVE_RECONCILIATION_PAGES; page += 1) {
+        if (!currentDone) {
+          const response = asRecord(
+            await this.#gateway.request("thread/list", {
+              archived: false,
+              ...(currentCursor === undefined ? {} : { cursor: currentCursor }),
+              limit: 100,
+              sortDirection: "desc",
+              sortKey: "updated_at",
+            }),
+          );
+          for (const thread of asRecordArray(response.data)) {
+            const listedThreadId = asString(thread.id);
+            if (listedThreadId !== undefined) {
+              currentThreadIds.add(listedThreadId);
+              this.#reconciledCurrentThreadIds.add(listedThreadId);
+            }
+          }
+          const nextCursor = asString(response.nextCursor);
+          currentDone = nextCursor === undefined || nextCursor === currentCursor;
+          currentCursor = nextCursor;
+        }
+        if (!archivedDone) {
+          const response = asRecord(
+            await this.#gateway.request("thread/list", {
+              archived: true,
+              ...(archivedCursor === undefined ? {} : { cursor: archivedCursor }),
+              limit: 100,
+              sortDirection: "desc",
+              sortKey: "updated_at",
+            }),
+          );
+          for (const thread of asRecordArray(response.data)) {
+            const listedThreadId = asString(thread.id);
+            if (listedThreadId !== undefined) {
+              archivedThreadIds.add(listedThreadId);
+              this.#archivedThreadIds.add(listedThreadId);
+              this.#pinnedThreadRanks.delete(listedThreadId);
+              this.#reconciledCurrentThreadIds.delete(listedThreadId);
+            }
+          }
+          const nextCursor = asString(response.nextCursor);
+          archivedDone = nextCursor === undefined || nextCursor === archivedCursor;
+          archivedCursor = nextCursor;
+        }
+        if (
+          [...targetThreadIds].every(
+            (threadId) => currentThreadIds.has(threadId) || archivedThreadIds.has(threadId),
+          ) ||
+          (currentDone && archivedDone)
+        ) {
+          break;
+        }
+      }
+    } catch (error) {
+      if (this.#archiveIntents.size > 0) {
+        throw error;
+      }
+      if (includeManagedCensus) {
+        this.#managedArchiveCensusPending = false;
+      }
+      return;
+    }
+    for (const [threadId, intent] of [...this.#archiveIntents]) {
+      const observedArchived = archivedThreadIds.has(threadId)
+        ? true
+        : currentThreadIds.has(threadId)
+          ? false
+          : undefined;
+      if (observedArchived === undefined || this.#settleArchiveIntent === undefined) {
+        continue;
+      }
+      await this.#settleArchiveIntent(threadId, observedArchived);
+      if (observedArchived) {
+        this.#forgetArchivedThreadTree(threadId);
+      } else {
+        this.#archivedThreadIds.delete(threadId);
+        this.#restoreArchiveIntentOwnership(intent);
+      }
+      this.#archiveIntents.delete(threadId);
+    }
+    if (this.#settleArchiveIntent !== undefined) {
+      for (const threadId of archivedThreadIds) {
+        if (!this.#managedThreads.has(threadId)) {
+          continue;
+        }
+        await this.#settleArchiveIntent(threadId, true);
+        this.#forgetArchivedThreadTree(threadId);
+      }
+    }
+    if (includeManagedCensus) {
+      this.#managedArchiveCensusPending = false;
+    }
+  }
+
+  #forgetArchivedThreadTree(rootThreadId: string): void {
+    const archivedThreadIds = new Set<string>([rootThreadId]);
+    for (const threadId of this.#sharedThreadSnapshots.keys()) {
+      if (topLevelThreadId(threadId, this.#sharedThreadSnapshots) === rootThreadId) {
+        archivedThreadIds.add(threadId);
+      }
+    }
+    for (const threadId of archivedThreadIds) {
+      this.#activeThreadIds.delete(threadId);
+      this.#archivedThreadIds.add(threadId);
+      this.#activeTurns.delete(threadId);
+      this.#compactingThreads.delete(threadId);
+      this.#directInputThreads.delete(threadId);
+      this.#loadedThreadIds.delete(threadId);
+      this.#managedThreads.delete(threadId);
+      this.#orphanedActiveTurns.delete(threadId);
+      this.#pendingTurnStarts.delete(threadId);
+      this.#pinnedThreadRanks.delete(threadId);
+      this.#publishedThreadSnapshotSignatures.delete(threadId);
+      this.#reconciledCurrentThreadIds.delete(threadId);
+      this.#recentlyCompletedCompactionTurns.delete(threadId);
+      this.#restoredPendingDesktopNotifications.delete(threadId);
+      this.#restoredThreadsNeedingRefresh.delete(threadId);
+      this.#sharedSubscribedThreads.delete(threadId);
+      this.#sharedSubscriptionPromises.delete(threadId);
+      this.#sharedThreadSnapshots.delete(threadId);
+      this.#threadRuntimeSettings.delete(threadId);
+      this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+      this.#turnStartsCompletedBeforeResponse.delete(threadId);
+      this.#turnStartTerminalStatusesBeforeResponse.delete(threadId);
+      this.#usageContexts.delete(threadId);
+    }
+  }
+
+  async #deliverPendingDesktopNotification(threadId: string): Promise<void> {
+    try {
+      await this.#notifyManagedThreadCreated?.(threadId);
+      await this.#clearPendingDesktopNotification?.(threadId);
+      this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+      this.#restoredPendingDesktopNotifications.delete(threadId);
+    } catch {
+      // Keep the durable pending marker so a later bounded reconciliation can
+      // retry. A host integration failure cannot invalidate the real thread.
+    }
+  }
+
+  #notifyManagedThreadAfterInitialTurn(threadId: string): Promise<void> {
+    const existing = this.#desktopNotificationAttempts.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    if (
+      !this.#threadsAwaitingInitialTurnCompletion.has(threadId) ||
+      !this.#notifyManagedThreadCreated
+    ) {
+      return Promise.resolve();
+    }
+    const attempt = this.#deliverPendingDesktopNotification(threadId);
+    this.#desktopNotificationAttempts.set(threadId, attempt);
+    void attempt.finally(() => {
+      if (this.#desktopNotificationAttempts.get(threadId) === attempt) {
+        this.#desktopNotificationAttempts.delete(threadId);
+      }
+    });
+    return attempt;
+  }
+
+  #consumeTurnTerminalBeforeResponse(
+    threadId: string,
+    turnId: string | undefined,
+  ): {
+    completedByTurnEvent: boolean;
+    observed: boolean;
+    threadStatus?: unknown;
+  } {
+    const completedTurnIds = this.#turnStartsCompletedBeforeResponse.get(threadId);
+    const terminalStatus = this.#turnStartTerminalStatusesBeforeResponse.get(threadId);
+    this.#turnStartsCompletedBeforeResponse.delete(threadId);
+    this.#turnStartTerminalStatusesBeforeResponse.delete(threadId);
+    const completedByTurnEvent = turnId !== undefined && completedTurnIds?.has(turnId) === true;
+    const threadStatus =
+      turnId !== undefined && terminalStatus?.turnId === turnId ? terminalStatus.status : undefined;
+    return {
+      completedByTurnEvent,
+      observed: completedByTurnEvent || threadStatus !== undefined,
+      ...(threadStatus === undefined ? {} : { threadStatus }),
+    };
+  }
+
+  #discardPendingDesktopNotification(threadId: string): Promise<void> {
+    const existing = this.#desktopNotificationAttempts.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    if (!this.#threadsAwaitingInitialTurnCompletion.has(threadId)) {
+      return Promise.resolve();
+    }
+    const attempt = (async () => {
+      try {
+        await this.#clearPendingDesktopNotification?.(threadId);
+        this.#threadsAwaitingInitialTurnCompletion.delete(threadId);
+        this.#restoredPendingDesktopNotifications.delete(threadId);
+      } catch {
+        // Retain the durable marker and retry on a later reconciliation.
+      }
+    })();
+    this.#desktopNotificationAttempts.set(threadId, attempt);
+    void attempt.finally(() => {
+      if (this.#desktopNotificationAttempts.get(threadId) === attempt) {
+        this.#desktopNotificationAttempts.delete(threadId);
+      }
+    });
+    return attempt;
+  }
+
+  async #runDesktopNotificationReconciliation(): Promise<void> {
+    if (!this.#notifyManagedThreadCreated) {
+      return;
+    }
+    const candidates = [...this.#threadsAwaitingInitialTurnCompletion].slice(
+      0,
+      DESKTOP_RECONCILIATION_BATCH_SIZE,
+    );
+    for (const threadId of candidates) {
+      try {
+        const response = await this.#readThreadForDisplay(threadId, true);
+        const thread = asRecord(response.thread);
+        const safelyTerminal = isInitialTurnSafelyTerminal(thread);
+        const restoredWithPersistedItem =
+          this.#restoredPendingDesktopNotifications.has(threadId) && hasPersistedTurnItem(thread);
+        if (asString(thread.id) === threadId && (safelyTerminal || restoredWithPersistedItem)) {
+          await this.#notifyManagedThreadAfterInitialTurn(threadId);
+        } else if (
+          asString(thread.id) === threadId &&
+          this.#restoredPendingDesktopNotifications.has(threadId) &&
+          isIdleThreadWithoutPersistedItem(thread)
+        ) {
+          await this.#discardPendingDesktopNotification(threadId);
+        }
+      } catch {
+        // A later running-state reconciliation retries only the durable pending
+        // IDs; historical managed threads are never opened.
+      } finally {
+        if (this.#threadsAwaitingInitialTurnCompletion.delete(threadId)) {
+          this.#threadsAwaitingInitialTurnCompletion.add(threadId);
+        }
+      }
+    }
+  }
+
+  async #refreshRestoredThread(threadId: string): Promise<ThreadDetail | undefined> {
+    if (!this.#restoredThreadsNeedingRefresh.has(threadId)) {
+      return undefined;
+    }
+    const response = asRecord(
+      await this.#gateway.request("thread/resume", {
+        ...(this.#sharedAppServer ? { excludeTurns: true } : {}),
+        threadId,
+      }),
+    );
+    const thread = asRecord(response.thread);
+    if (!asString(thread.id)) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    await this.#refreshProjectRegistry();
+    this.#rememberRuntimeSettings(threadId, response);
+    this.#rememberDirectInput(threadId, thread);
+    const projectId = this.#projectIdForCwd(thread.cwd);
+    let detail = projectThreadDetail(thread, {
+      directInputAvailable: this.#isDirectInputAvailable(threadId),
+      managed: true,
+      ...this.#pinnedProjectionOptions(threadId),
+      ...this.#runtimeProjectionOptions(threadId),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
+    this.#restoredThreadsNeedingRefresh.delete(threadId);
+    detail = await this.#recoverSharedActiveTurn(
+      detail,
+      asString(thread.path) ?? asString(response.path),
+    );
+    this.#markExistingActiveTurnUncontrollable(detail);
+    if (isInitialTurnSafelyTerminal(thread)) {
+      void this.#notifyManagedThreadAfterInitialTurn(threadId);
+    }
+    return detail;
+  }
+
+  async #recoverSharedActiveTurn(
+    detail: ThreadDetail,
+    sessionPath?: string,
+    suppliedPersistedHead?: PersistedThreadHead,
+  ): Promise<ThreadDetail> {
+    if (
+      !this.#sharedAppServer ||
+      detail.activeTurnId !== undefined ||
+      (detail.state !== "running" && detail.state !== "waiting-for-approval") ||
+      !detail.availableActions.changeModelNextTurn
+    ) {
+      return detail;
+    }
+
+    let turnId = this.#activeTurns.get(detail.id);
+    const persistedHead =
+      suppliedPersistedHead ?? (await this.#readPersistedThreadHeadSafely(detail.id, sessionPath));
+    turnId ??= persistedHead?.activeTurnId;
+    const persistedControlState = persistedHead?.controlState;
+    if (persistedControlState === "idle") {
+      this.#orphanedActiveTurns.delete(detail.id);
+      return detail;
+    }
+    if (
+      turnId === undefined &&
+      (persistedControlState === "unknown" || persistedControlState === "active")
+    ) {
+      // The bounded lifecycle reader could not prove which turn is active.
+      // Preserve that uncertainty across the normal projection pass so every
+      // mutating control fails closed until a later stable read proves active
+      // or idle. A small session may still recover the concrete id from the
+      // app-server below; huge sessions deliberately stay off that path.
+      this.#orphanedActiveTurns.add(detail.id);
+    }
+    const appServerHistoryUnsafe =
+      (persistedHead?.sourceBytes ?? 0) >= MAX_APP_SERVER_HISTORY_SESSION_BYTES;
+    if (turnId === undefined && !appServerHistoryUnsafe) {
+      try {
+        const response = asRecord(
+          await this.#gateway.request("thread/turns/list", {
+            itemsView: "summary",
+            limit: 1,
+            sortDirection: "desc",
+            threadId: detail.id,
+          }),
+        );
+        const latest = asRecordArray(response.data).at(0);
+        if (latest?.status === "inProgress") {
+          turnId = asString(latest.id);
+        }
+      } catch {
+        // Older Desktop/app-server versions may not expose paginated turns.
+        // Keep the active task visible but fail closed instead of guessing an
+        // expectedTurnId or accidentally starting a competing turn.
+        return detail;
+      }
+    }
+    if (turnId === undefined) {
+      return detail;
+    }
+    return {
+      ...detail,
+      activeTurnId: turnId,
+      availableActions: {
+        ...detail.availableActions,
+        interrupt: true,
+        reply: false,
+        steer: true,
+      },
+    };
+  }
+
+  async #readPersistedThreadHeadSafely(
+    threadId: string,
+    sessionPath?: string,
+  ): Promise<PersistedThreadHead | undefined> {
+    if (this.#readPersistedThreadHead === undefined) return undefined;
+    try {
+      const head = await this.#readPersistedThreadHead(threadId, sessionPath);
+      if (head === undefined) return undefined;
+      const sourceBytes = asSafeUnsignedInteger(head.sourceBytes);
+      const activeTurnId = boundedPlainString(head.activeTurnId, 512);
+      const controlState =
+        head.controlState === "active" ||
+        head.controlState === "idle" ||
+        head.controlState === "unknown"
+          ? head.controlState
+          : undefined;
+      if (sourceBytes === undefined) return undefined;
+      return {
+        ...(activeTurnId === undefined ? {} : { activeTurnId }),
+        ...(controlState === undefined ? {} : { controlState }),
+        sourceBytes,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  #markExistingActiveTurnUncontrollable(detail: ThreadDetail): void {
+    if (detail.activeTurnId) {
+      if (this.#sharedAppServer) {
+        this.#activeTurns.set(detail.id, detail.activeTurnId);
+        this.#orphanedActiveTurns.delete(detail.id);
+      } else {
+        this.#activeTurns.delete(detail.id);
+        this.#orphanedActiveTurns.add(detail.id);
+      }
+    } else {
+      this.#activeTurns.delete(detail.id);
+      if (detail.state !== "running" && detail.state !== "waiting-for-approval") {
+        this.#orphanedActiveTurns.delete(detail.id);
+      }
+    }
+  }
+
+  #withControlState(detail: ThreadDetail): ThreadDetail {
+    if (this.#orphanedActiveTurns.has(detail.id)) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    if (this.#compactingThreads.has(detail.id)) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    const recentlyCompletedCompaction = this.#recentlyCompletedCompactionTurns.get(detail.id);
+    if (
+      recentlyCompletedCompaction !== undefined &&
+      detail.activeTurnId === recentlyCompletedCompaction
+    ) {
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    if (recentlyCompletedCompaction !== undefined) {
+      this.#recentlyCompletedCompactionTurns.delete(detail.id);
+    }
+    if (detail.activeTurnId && this.#activeTurns.get(detail.id) !== detail.activeTurnId) {
+      this.#orphanedActiveTurns.add(detail.id);
+      return {
+        ...detail,
+        availableActions: {
+          changeModelNextTurn: false,
+          interrupt: false,
+          reply: false,
+          steer: false,
+        },
+      };
+    }
+    return detail;
+  }
+
+  #assertTurnControlAvailable(threadId: string): void {
+    if (this.#orphanedActiveTurns.has(threadId)) {
+      throw new DomainError(
+        "TURN_CONTROL_LOST",
+        "This response still appears active after the background connection was interrupted; the remote service will not take over blindly. Confirm its state in Desktop first.",
+        409,
+      );
+    }
+  }
+
+  #assertNotCompacting(threadId: string): void {
+    if (this.#compactingThreads.has(threadId)) {
+      throw new DomainError(
+        "TURN_MISMATCH",
+        "Conversation context is being compacted; wait for it to finish before continuing",
+        409,
+      );
+    }
+  }
+
+  #reserveCompaction(threadId: string): CompactionRuntimeState {
+    if (
+      this.#activeTurns.has(threadId) ||
+      this.#pendingTurnStarts.has(threadId) ||
+      this.#compactingThreads.has(threadId)
+    ) {
+      throw new DomainError(
+        "TURN_MISMATCH",
+        "Another operation is running in this conversation; finish it before compacting context",
+        409,
+      );
+    }
+    this.#recentlyCompletedCompactionTurns.delete(threadId);
+    const reservation: CompactionRuntimeState = { phase: "reserving" };
+    this.#compactingThreads.set(threadId, reservation);
+    return reservation;
+  }
+
+  #reserveTurnStart(threadId: string): void {
+    if (
+      this.#activeTurns.has(threadId) ||
+      this.#pendingTurnStarts.has(threadId) ||
+      this.#compactingThreads.has(threadId)
+    ) {
+      throw new DomainError(
+        "TURN_MISMATCH",
+        "The current response has not finished or is still starting",
+        409,
+      );
+    }
+    this.#pendingTurnStarts.add(threadId);
+  }
+
+  #rememberDirectInput(threadId: string, thread: Record<string, unknown>): void {
+    if (thread.canAcceptDirectInput === true) {
+      this.#directInputThreads.add(threadId);
+    } else {
+      this.#directInputThreads.delete(threadId);
+    }
+  }
+
+  #requireDirectInput(threadId: string): void {
+    if (!this.#isDirectInputAvailable(threadId)) {
+      throw new DomainError(
+        "DIRECT_INPUT_UNAVAILABLE",
+        "This conversation cannot continue from the remote service yet; confirm that it is ready in Desktop first.",
+        409,
+      );
+    }
+  }
+
+  #isDirectInputAvailable(threadId: string): boolean {
+    if (this.#sharedAppServer) {
+      // A successful thread/resume through the shared Broker is the stable
+      // control boundary. Newer Desktop builds may omit the legacy
+      // canAcceptDirectInput hint or report a stale false value. Exact
+      // subscription and turn ids still fail closed, and app-server remains
+      // authoritative for actions that are genuinely unsupported.
+      return this.#sharedSubscribedThreads.has(threadId);
+    }
+    return this.#directInputThreads.has(threadId);
+  }
+
+  #rememberRuntimeSettings(threadId: string, source: Record<string, unknown>): void {
+    const current = this.#threadRuntimeSettings.get(threadId) ?? {};
+    const next: ThreadRuntimeSettingsState = { ...current };
+    const thread = asRecord(source.thread);
+    if (Object.keys(thread).length > 0) {
+      this.#applyRuntimeSettingsTree(next, thread);
+    }
+    this.#applyRuntimeSettingsTree(next, source);
+    const pending = this.#pendingRuntimeSettings.get(threadId);
+    if (pending !== undefined) {
+      Object.assign(next, pending);
+    }
+    this.#threadRuntimeSettings.set(threadId, next);
+  }
+
+  #rememberPendingRuntimeSettings(threadId: string, source: Record<string, unknown>): void {
+    const current = this.#pendingRuntimeSettings.get(threadId) ?? {};
+    const next: ThreadRuntimeSettingsState = { ...current };
+    this.#applyRuntimeSettingsTree(next, source);
+    this.#pendingRuntimeSettings.set(threadId, next);
+  }
+
+  #applyRuntimeSettingsTree(
+    target: ThreadRuntimeSettingsState,
+    source: Record<string, unknown>,
+  ): void {
+    const turn = preferredRuntimeSettingsSource(asRecordArray(source.turns));
+    if (turn !== undefined) {
+      this.#applyRuntimeSettingsFields(target, turn);
+      this.#applyRuntimeSettingsFields(target, asRecord(turn.settings));
+      this.#applyRuntimeSettingsFields(target, asRecord(turn.turnSettings));
+    }
+    this.#applyRuntimeSettingsFields(target, source);
+    this.#applyRuntimeSettingsFields(target, asRecord(source.settings));
+    this.#applyRuntimeSettingsFields(target, asRecord(source.threadSettings));
+  }
+
+  #applyRuntimeSettingsFields(
+    target: ThreadRuntimeSettingsState,
+    source: Record<string, unknown>,
+  ): void {
+    const modelField = Object.hasOwn(source, "model")
+      ? "model"
+      : Object.hasOwn(source, "model_id")
+        ? "model_id"
+        : undefined;
+    if (modelField !== undefined) {
+      if (source[modelField] === null) {
+        target.model = null;
+      } else {
+        const model = boundedPlainString(source[modelField], 256);
+        if (model !== undefined) {
+          target.model = model;
+        }
+      }
+    }
+    const effortField = Object.hasOwn(source, "reasoningEffort")
+      ? "reasoningEffort"
+      : Object.hasOwn(source, "effort")
+        ? "effort"
+        : Object.hasOwn(source, "reasoning_effort")
+          ? "reasoning_effort"
+          : undefined;
+    if (effortField !== undefined) {
+      const rawEffort = source[effortField];
+      if (rawEffort === null) {
+        target.reasoningEffort = null;
+      } else {
+        const reasoningEffort = asReasoningEffort(rawEffort);
+        if (reasoningEffort !== undefined) {
+          target.reasoningEffort = reasoningEffort;
+        }
+      }
+    }
+    for (const [field, alternate] of [
+      ["serviceTier", "service_tier"],
+      ["approvalPolicy", "approval_policy"],
+      ["approvalsReviewer", "approvals_reviewer"],
+    ] as const) {
+      const sourceField = Object.hasOwn(source, field)
+        ? field
+        : Object.hasOwn(source, alternate)
+          ? alternate
+          : undefined;
+      if (sourceField === undefined) {
+        continue;
+      }
+      if (source[sourceField] === null) {
+        target[field] = null;
+      } else {
+        const value = boundedPlainString(source[sourceField], 256);
+        if (value !== undefined) {
+          target[field] = value;
+        }
+      }
+    }
+    const activePermissionProfile = asRecord(source.activePermissionProfile);
+    const permissionProfileField = Object.hasOwn(source, "permissionProfileId")
+      ? "permissionProfileId"
+      : Object.hasOwn(source, "permissions")
+        ? "permissions"
+        : Object.hasOwn(source, "activePermissionProfile")
+          ? "activePermissionProfile"
+          : undefined;
+    if (permissionProfileField !== undefined) {
+      const rawPermission =
+        permissionProfileField === "activePermissionProfile"
+          ? activePermissionProfile.id
+          : source[permissionProfileField];
+      if (
+        source[permissionProfileField] === null ||
+        (permissionProfileField === "activePermissionProfile" &&
+          source.activePermissionProfile === null)
+      ) {
+        target.permissionProfileId = null;
+      } else {
+        const permissionProfileId = boundedPlainString(rawPermission, 256);
+        if (permissionProfileId !== undefined) {
+          target.permissionProfileId = permissionProfileId;
+        }
+      }
+    }
+    const collaborationField = Object.hasOwn(source, "collaborationMode")
+      ? "collaborationMode"
+      : Object.hasOwn(source, "collaboration_mode")
+        ? "collaboration_mode"
+        : undefined;
+    if (collaborationField !== undefined) {
+      const rawMode = source[collaborationField];
+      if (rawMode === null) {
+        target.collaborationMode = null;
+      } else {
+        const mode = asRecord(rawMode);
+        const collaborationMode =
+          boundedPlainString(rawMode, 256) ??
+          boundedPlainString(mode.name, 256) ??
+          boundedPlainString(mode.mode, 256);
+        if (collaborationMode !== undefined) {
+          target.collaborationMode = collaborationMode;
+        }
+      }
+    }
+  }
+
+  #runtimeProjectionOptions(threadId: string): ThreadRuntimeSettingsState {
+    return this.#threadRuntimeSettings.get(threadId) ?? {};
+  }
+
+  async #hydratePersistedRuntimeSettings(
+    threadId: string,
+    sessionPath: string | undefined,
+  ): Promise<void> {
+    if (this.#readPersistedRuntimeSettings === undefined) return;
+    try {
+      const persisted = await this.#readPersistedRuntimeSettings(threadId, sessionPath);
+      if (persisted === undefined) return;
+      const current = this.#threadRuntimeSettings.get(threadId) ?? {};
+      this.#threadRuntimeSettings.set(threadId, {
+        ...(persisted.model === undefined ? {} : { model: persisted.model }),
+        ...(persisted.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: persisted.reasoningEffort }),
+        ...(persisted.serviceTier === undefined ? {} : { serviceTier: persisted.serviceTier }),
+        ...(persisted.permissionProfileId === undefined
+          ? {}
+          : { permissionProfileId: persisted.permissionProfileId }),
+        ...(persisted.approvalPolicy === undefined
+          ? {}
+          : { approvalPolicy: persisted.approvalPolicy }),
+        ...(persisted.approvalsReviewer === undefined
+          ? {}
+          : { approvalsReviewer: persisted.approvalsReviewer }),
+        ...(persisted.collaborationMode === undefined
+          ? {}
+          : { collaborationMode: persisted.collaborationMode }),
+        ...current,
+      });
+    } catch {
+      // The Desktop session is an optional local fallback. Protocol values
+      // remain authoritative and unreadable session data stays unavailable.
+    }
+  }
+
+  #rememberUsageContext(threadId: string, rawUsage: unknown): void {
+    const usage = asRecord(rawUsage);
+    const rawTotalTokens = asFiniteNumber(asRecord(usage.last).totalTokens);
+    const rawLimitTokens = asFiniteNumber(usage.modelContextWindow);
+    const totalTokens =
+      rawTotalTokens !== undefined && rawTotalTokens >= 0 ? rawTotalTokens : undefined;
+    const limitTokens =
+      rawLimitTokens !== undefined && rawLimitTokens > 0 ? rawLimitTokens : undefined;
+    if (totalTokens === undefined && limitTokens === undefined) {
+      return;
+    }
+    const current = this.#usageContexts.get(threadId) ?? {};
+    const usedTokens = totalTokens ?? current.usedTokens;
+    const contextLimit = limitTokens ?? current.limitTokens;
+    this.#usageContexts.set(threadId, {
+      ...(usedTokens === undefined ? {} : { usedTokens }),
+      ...(contextLimit === undefined ? {} : { limitTokens: contextLimit }),
+      ...(usedTokens === undefined || contextLimit === undefined
+        ? {}
+        : { usedPercent: clampPercent((usedTokens / contextLimit) * 100) }),
+    });
+  }
+
+  #rememberUsageFromSource(threadId: string, source: Record<string, unknown>): void {
+    const records = [
+      source,
+      asRecord(source.thread),
+      asRecord(source.extra),
+      asRecord(asRecord(source.thread).extra),
+    ];
+    for (const record of [...records]) {
+      records.push(...asRecordArray(record.turns));
+    }
+    for (const record of records) {
+      if (Object.hasOwn(record, "tokenUsage")) {
+        this.#rememberUsageContext(threadId, record.tokenUsage);
+      }
+      const usage = asRecord(record.usage);
+      if (Object.hasOwn(usage, "last") || Object.hasOwn(usage, "modelContextWindow")) {
+        this.#rememberUsageContext(threadId, usage);
+      }
+      const context = asRecord(record.context);
+      const usedTokens = asFiniteNumber(context.usedTokens);
+      const limitTokens = asFiniteNumber(context.limitTokens);
+      if (
+        (usedTokens !== undefined && usedTokens >= 0) ||
+        (limitTokens !== undefined && limitTokens > 0)
+      ) {
+        this.#rememberUsageContext(threadId, {
+          last: {
+            ...(usedTokens === undefined || usedTokens < 0 ? {} : { totalTokens: usedTokens }),
+          },
+          ...(limitTokens === undefined || limitTokens <= 0
+            ? {}
+            : { modelContextWindow: limitTokens }),
+        });
+      }
+    }
+  }
+
+  async #hydrateUsageContext(threadId: string): Promise<void> {
+    let sessionPath: string | undefined;
+    if (this.#sharedAppServer) {
+      const thread = this.#sharedThreadSnapshots.get(threadId);
+      if (thread !== undefined && asString(thread.id) === threadId) {
+        this.#rememberUsageFromSource(threadId, thread);
+        sessionPath = asString(thread.path);
+      }
+    } else {
+      try {
+        const response = asRecord(
+          await this.#gateway.request("thread/read", {
+            includeTurns: false,
+            threadId,
+          }),
+        );
+        this.#rememberUsageFromSource(threadId, response);
+        sessionPath = asString(asRecord(response.thread).path) ?? asString(response.path);
+      } catch {
+        // Current app-server schemas do not guarantee persisted token usage on
+        // thread/read. Absence stays unavailable rather than becoming a fake 0.
+      }
+    }
+    await this.#hydratePersistedUsageContext(threadId, sessionPath);
+  }
+
+  async #hydratePersistedUsageContext(
+    threadId: string,
+    sessionPath: string | undefined,
+  ): Promise<void> {
+    const current = this.#usageContexts.get(threadId);
+    if (
+      this.#readPersistedUsageContext === undefined ||
+      (current?.usedTokens !== undefined && current.limitTokens !== undefined)
+    ) {
+      return;
+    }
+    try {
+      const persisted = await this.#readPersistedUsageContext(threadId, sessionPath);
+      if (persisted === undefined) {
+        return;
+      }
+      this.#rememberUsageContext(threadId, {
+        last: {
+          ...(persisted.usedTokens === undefined ? {} : { totalTokens: persisted.usedTokens }),
+        },
+        ...(persisted.limitTokens === undefined
+          ? {}
+          : { modelContextWindow: persisted.limitTokens }),
+      });
+    } catch {
+      // The local Desktop session is an optional read-only fallback. Protocol
+      // usage remains authoritative and an unsafe or unreadable file stays unavailable.
+    }
+  }
+
+  #usageContextFor(threadId: string | undefined): UsageSnapshot["context"] | undefined {
+    if (threadId) {
+      return this.#usageContexts.get(threadId);
+    }
+    return undefined;
+  }
+
+  async #configureCollaboration(
+    threadId: string,
+    collaborationMode: string,
+    requestedModel?: string,
+    requestedEffort?: ReasoningEffort,
+  ): Promise<ServiceDegradation | undefined> {
+    try {
+      await this.#gateway.request("thread/settings/update", {
+        threadId,
+        collaborationMode: await this.#resolveCollaborationSettings(
+          collaborationMode,
+          requestedModel,
+          requestedEffort,
+        ),
+      });
+      return undefined;
+    } catch {
+      return collaborationUnavailable();
+    }
+  }
+
+  async #resolveCollaborationSettings(
+    collaborationMode: string,
+    requestedModel?: string,
+    requestedEffort?: ReasoningEffort,
+  ): Promise<Record<string, unknown>> {
+    const response = asRecord(await this.#gateway.request("collaborationMode/list", {}));
+    const selected = asRecordArray(response.data).find(
+      (mode) => asString(mode.name) === collaborationMode,
+    );
+    if (!selected) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "This collaboration mode is unavailable; settings and the message were not changed.",
+        409,
+      );
+    }
+    // The collaboration preset supplies defaults, but an explicit model or
+    // effort chosen in the remote UI must remain authoritative. Otherwise a
+    // preset can silently replace the user's visible next-turn settings.
+    const model = requestedModel ?? asString(selected.model);
+    if (!model) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "This collaboration mode has no available model; settings and the message were not changed.",
+        409,
+      );
+    }
+    return {
+      mode: asString(selected.mode) ?? "default",
+      settings: {
+        developer_instructions: null,
+        model,
+        reasoning_effort: requestedEffort ?? asReasoningEffort(selected.reasoning_effort) ?? null,
+      },
+    };
+  }
+
+  #requireProtocolMethods(methods: readonly string[], message: string): void {
+    if (methods.every((method) => this.#protocolClientMethods.has(method))) {
+      return;
+    }
+    throw new DomainError("FEATURE_UNAVAILABLE", message, 409);
+  }
+
+  async #requireAvailablePermissionProfile(
+    threadId: string,
+    permissionProfileId: string,
+  ): Promise<void> {
+    const normalized = requireNonEmpty(permissionProfileId, "permissions");
+    const profiles = await this.listPermissionProfiles({ threadId });
+    const selected = profiles.data.find((profile) => profile.id === normalized);
+    if (!selected?.allowed) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "This permission is unavailable; settings and the message were not changed.",
+        409,
+      );
+    }
+  }
+
+  async #requireAvailableApprovalReviewer(approvalReviewer: string): Promise<void> {
+    const normalized = requireNonEmpty(approvalReviewer, "approval reviewer");
+    const reviewers = await this.listApprovalReviewers();
+    if (!reviewers.data.some((reviewer) => reviewer.id === normalized)) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "This approval reviewer was not declared by the current Codex runtime; settings and the message were not changed.",
+        409,
+      );
+    }
+  }
+
+  async #requireAvailableApprovalPolicy(approvalPolicy: string): Promise<void> {
+    const normalized = requireNonEmpty(approvalPolicy, "approval policy");
+    const policies = await this.listApprovalPolicies();
+    if (!policies.data.some((policy) => policy.id === normalized)) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "This approval policy was not declared by the current Codex runtime; settings and the message were not changed.",
+        409,
+      );
+    }
+  }
+
+  #requireManagedThread(threadId: string): void {
+    requireNonEmpty(threadId, "thread id");
+    if (!this.#isControllableThread(threadId)) {
+      throw new DomainError(
+        "THREAD_READ_ONLY",
+        "This Desktop conversation is a read-only snapshot; take it over from mobile before operating on it.",
+        409,
+      );
+    }
+  }
+
+  async #prepareManagedThread(threadId: string): Promise<void> {
+    requireNonEmpty(threadId, "thread id");
+    if (!this.#managedThreads.has(threadId)) {
+      this.#requireManagedThread(threadId);
+    }
+    await this.#ensureSharedThread(threadId);
+    this.#requireManagedThread(threadId);
+  }
+
+  #isControllableThread(threadId: string): boolean {
+    if (!this.#managedThreads.has(threadId)) {
+      return false;
+    }
+    if (!this.#sharedAppServer) {
+      return true;
+    }
+    if (!this.#sharedSubscribedThreads.has(threadId)) {
+      return false;
+    }
+    return asString(this.#sharedThreadSnapshots.get(threadId)?.parentThreadId) === undefined;
+  }
+
+  #rememberSharedThreadSnapshot(thread: Record<string, unknown>): void {
+    const threadId = asString(thread.id);
+    if (threadId === undefined || this.#archivedThreadIds.has(threadId)) {
+      return;
+    }
+    this.#sharedThreadSnapshots.set(threadId, thread);
+    if (rawThreadIsActive(thread)) {
+      this.#activeThreadIds.add(threadId);
+    } else {
+      this.#activeThreadIds.delete(threadId);
+    }
+  }
+
+  #requireSharedThreadMetadata(threadId: string): Record<string, unknown> {
+    const thread = this.#sharedThreadSnapshots.get(threadId);
+    if (thread === undefined || asString(thread.id) !== threadId) {
+      throw new DomainError(
+        "FEATURE_UNAVAILABLE",
+        "The project for this conversation could not be safely confirmed; complete history was not read. Refresh and try again.",
+        409,
+      );
+    }
+    return thread;
+  }
+
+  #activeTopLevelThreadIds(): Set<string> {
+    const rootThreadIds = new Set<string>();
+    for (const threadId of this.#activeThreadIds) {
+      const rootThreadId = topLevelThreadId(threadId, this.#sharedThreadSnapshots);
+      if (rootThreadId !== undefined) {
+        rootThreadIds.add(rootThreadId);
+      }
+    }
+    return rootThreadIds;
+  }
+
+  #cachedThreadTreeIsActive(rootThreadId: string): boolean {
+    for (const threadId of new Set([
+      ...this.#activeThreadIds,
+      ...this.#activeTurns.keys(),
+      ...this.#compactingThreads.keys(),
+      ...this.#pendingTurnStarts,
+    ])) {
+      if (
+        threadId === rootThreadId ||
+        topLevelThreadId(threadId, this.#sharedThreadSnapshots) === rootThreadId
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  #projectTopLevelThreadSummary(
+    rootThread: Record<string, unknown>,
+    byId: Map<string, Record<string, unknown>>,
+    knownChildCount?: number,
+  ): ThreadSummary {
+    const rootThreadId = asString(rootThread.id) ?? "";
+    const projectId = this.#projectIdForCwd(rootThread.cwd);
+    const rootSummary = projectThreadSummary(rootThread, {
+      managed: this.#isControllableThread(rootThreadId),
+      ...this.#pinnedProjectionOptions(rootThreadId),
+      ...this.#runtimeProjectionOptions(rootThreadId),
+      ...(projectId === undefined ? {} : { projectId }),
+    });
+    let childCount = knownChildCount ?? 0;
+    let hasWaitingDescendant = false;
+    let hasRunningDescendant = false;
+    let updatedAt = rootSummary.updatedAt;
+    if (knownChildCount === undefined) {
+      childCount = 0;
+    }
+    for (const [threadId, thread] of byId) {
+      if (threadId === rootThreadId || !isDescendantOf(thread, rootThreadId, byId)) {
+        continue;
+      }
+      if (knownChildCount === undefined) {
+        childCount += 1;
+      }
+      const childSummary = projectThreadSummary(thread, {
+        managed: this.#isControllableThread(threadId),
+        ...this.#runtimeProjectionOptions(threadId),
+      });
+      hasWaitingDescendant ||= childSummary.state === "waiting-for-approval";
+      hasRunningDescendant ||= childSummary.state === "running";
+      if (childSummary.updatedAt > updatedAt) {
+        updatedAt = childSummary.updatedAt;
+      }
+    }
+    const state: ThreadSummary["state"] = hasWaitingDescendant
+      ? "waiting-for-approval"
+      : hasRunningDescendant
+        ? "running"
+        : rootSummary.state;
+    return {
+      ...rootSummary,
+      state,
+      updatedAt,
+      ...(childCount > 0 ? { childCount } : {}),
+    };
+  }
+
+  async #hydrateSharedThreadAncestors(seedThreadIds: Iterable<string>): Promise<void> {
+    const queued = new Set<string>();
+    const queue: string[] = [];
+    const enqueueParent = (threadId: string): void => {
+      const parentThreadId = asString(this.#sharedThreadSnapshots.get(threadId)?.parentThreadId);
+      if (parentThreadId !== undefined && !queued.has(parentThreadId)) {
+        queued.add(parentThreadId);
+        queue.push(parentThreadId);
+      }
+    };
+    for (const threadId of seedThreadIds) {
+      queued.add(threadId);
+      enqueueParent(threadId);
+    }
+
+    let hydratedCount = 0;
+    while (queue.length > 0 && hydratedCount < MAX_SUBAGENT_ANCESTOR_READS) {
+      const batch = queue.splice(
+        0,
+        Math.min(SUBAGENT_ANCESTOR_READ_CONCURRENCY, MAX_SUBAGENT_ANCESTOR_READS - hydratedCount),
+      );
+      hydratedCount += batch.length;
+      const hydratedParents = await Promise.all(
+        batch.map(async (parentThreadId): Promise<string | undefined> => {
+          if (!this.#sharedSubscribedThreads.has(parentThreadId)) {
+            try {
+              await this.#ensureSharedThread(parentThreadId);
+            } catch {
+              // A historical ancestor may no longer be resumable. A metadata
+              // read is still sufficient to fold its descendants correctly.
+            }
+          }
+          if (!this.#sharedThreadSnapshots.has(parentThreadId)) {
+            try {
+              const response = asRecord(
+                await this.#gateway.request("thread/read", {
+                  includeTurns: false,
+                  threadId: parentThreadId,
+                }),
+              );
+              const thread = asRecord(response.thread);
+              if (asString(thread.id) === parentThreadId) {
+                this.#rememberRuntimeSettings(parentThreadId, response);
+                this.#rememberUsageFromSource(parentThreadId, response);
+                this.#rememberSharedThreadSnapshot(thread);
+              }
+            } catch {
+              return undefined;
+            }
+          }
+          return asString(this.#sharedThreadSnapshots.get(parentThreadId)?.parentThreadId);
+        }),
+      );
+      for (const parentThreadId of hydratedParents) {
+        if (parentThreadId !== undefined && !queued.has(parentThreadId)) {
+          queued.add(parentThreadId);
+          queue.push(parentThreadId);
+        }
+      }
+    }
+  }
+
+  async #promoteLoadedSharedRoots(seedThreadIds: Iterable<string>): Promise<void> {
+    const rootThreadIds = new Set<string>();
+    for (const threadId of seedThreadIds) {
+      const rootThreadId = topLevelThreadId(threadId, this.#sharedThreadSnapshots);
+      if (rootThreadId !== undefined) {
+        rootThreadIds.add(rootThreadId);
+      }
+    }
+    for (const rootThreadId of rootThreadIds) {
+      await this.#promoteSharedTopLevelThread(rootThreadId);
+    }
+  }
+
+  async #promoteSharedTopLevelThread(threadId: string): Promise<string | undefined> {
+    if (!this.#sharedAppServer) {
+      return undefined;
+    }
+    const rootThreadId = topLevelThreadId(threadId, this.#sharedThreadSnapshots);
+    if (rootThreadId === undefined) {
+      return undefined;
+    }
+    await this.#ensureSharedThread(rootThreadId);
+    const rootThread = this.#sharedThreadSnapshots.get(rootThreadId);
+    if (
+      rootThread === undefined ||
+      asString(rootThread.parentThreadId) !== undefined ||
+      !this.#sharedSubscribedThreads.has(rootThreadId)
+    ) {
+      return undefined;
+    }
+    await this.#markManaged(rootThreadId, false);
+    return rootThreadId;
+  }
+
+  #publishTopLevelSnapshotsFor(threadIds: Iterable<string>): void {
+    if (!this.#events) {
+      return;
+    }
+    const rootThreadIds = new Set<string>();
+    for (const threadId of threadIds) {
+      const rootThreadId = topLevelThreadId(threadId, this.#sharedThreadSnapshots);
+      if (rootThreadId !== undefined) {
+        rootThreadIds.add(rootThreadId);
+      }
+    }
+    const descendantCounts = descendantCountsByRoot(this.#sharedThreadSnapshots);
+    for (const rootThreadId of rootThreadIds) {
+      const rootThread = this.#sharedThreadSnapshots.get(rootThreadId);
+      if (rootThread === undefined) {
+        continue;
+      }
+      const snapshot = this.#projectTopLevelThreadSummary(
+        rootThread,
+        this.#sharedThreadSnapshots,
+        descendantCounts.get(rootThreadId),
+      );
+      const signature = JSON.stringify(snapshot);
+      if (this.#publishedThreadSnapshotSignatures.get(rootThreadId) === signature) {
+        continue;
+      }
+      this.#publishedThreadSnapshotSignatures.set(rootThreadId, signature);
+      this.#events.append("thread.snapshot", snapshot, { threadId: rootThreadId });
+    }
+  }
+
+  #applySharedThreadLifecycleNotification(
+    threadId: string,
+    notification: AppServerNotificationLike,
+  ): boolean {
+    const current = this.#sharedThreadSnapshots.get(threadId);
+    if (current === undefined) {
+      return false;
+    }
+    const params = asRecord(notification.params);
+    const next: Record<string, unknown> = { ...current };
+    if (notification.method === "thread/status/changed") {
+      if (!Object.hasOwn(params, "status")) {
+        return false;
+      }
+      next.status = params.status;
+    } else {
+      const turn = asRecord(params.turn);
+      const turnId = asString(turn.id);
+      if (turnId === undefined) {
+        return false;
+      }
+      const turns = [...asRecordArray(current.turns)];
+      const existingTurnIndex = turns.findIndex((candidate) => asString(candidate.id) === turnId);
+      if (existingTurnIndex >= 0) {
+        turns[existingTurnIndex] = turn;
+      } else {
+        turns.push(turn);
+      }
+      next.turns = turns;
+      if (notification.method === "turn/started") {
+        next.status = {
+          activeFlags: [],
+          type: "active",
+        };
+      } else if (notification.method === "turn/completed") {
+        next.status = turns.some((candidate) => candidate.status === "inProgress")
+          ? { activeFlags: [], type: "active" }
+          : { type: "idle" };
+      } else {
+        return false;
+      }
+    }
+    this.#rememberSharedThreadSnapshot(next);
+    return true;
+  }
+
+  async #hydrateSharedThreadLifecycleNotification(
+    threadId: string,
+    notification: AppServerNotificationLike,
+  ): Promise<void> {
+    await this.#ensureSharedThread(threadId);
+    if (!this.#sharedThreadSnapshots.has(threadId)) {
+      const response = asRecord(
+        await this.#gateway.request("thread/read", {
+          includeTurns: false,
+          threadId,
+        }),
+      );
+      const thread = asRecord(response.thread);
+      if (asString(thread.id) !== threadId) {
+        throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+      }
+      this.#rememberRuntimeSettings(threadId, response);
+      this.#rememberUsageFromSource(threadId, response);
+      this.#rememberSharedThreadSnapshot(thread);
+    }
+    if (!this.#applySharedThreadLifecycleNotification(threadId, notification)) {
+      return;
+    }
+    await this.#hydrateSharedThreadAncestors([threadId]);
+    await this.#promoteSharedTopLevelThread(threadId);
+    this.#publishTopLevelSnapshotsFor(new Set([threadId]));
+  }
+
+  #isTopLevelThreadSnapshot(payload: unknown): boolean {
+    const snapshot = asRecord(payload);
+    const threadId = asString(snapshot.id);
+    if (threadId === undefined || asString(snapshot.parentThreadId) !== undefined) {
+      return false;
+    }
+    return asString(this.#sharedThreadSnapshots.get(threadId)?.parentThreadId) === undefined;
+  }
+
+  async #hydrateStartedThreadSnapshot(threadId: string): Promise<void> {
+    await this.#ensureSharedThread(threadId);
+    const cachedThread = this.#sharedThreadSnapshots.get(threadId);
+    const response =
+      cachedThread === undefined
+        ? asRecord(
+            await this.#gateway.request("thread/read", {
+              includeTurns: false,
+              threadId,
+            }),
+          )
+        : { thread: cachedThread };
+    const thread = cachedThread ?? asRecord(response.thread);
+    if (asString(thread.id) !== threadId) {
+      throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+    }
+    this.#rememberRuntimeSettings(threadId, response);
+    this.#rememberUsageFromSource(threadId, response);
+    this.#rememberSharedThreadSnapshot(thread);
+    await this.#hydrateSharedThreadAncestors([threadId]);
+    await this.#promoteSharedTopLevelThread(threadId);
+    this.#publishTopLevelSnapshotsFor(new Set([threadId]));
+  }
+
+  async #ensureSharedThread(threadId: string): Promise<void> {
+    if (
+      !this.#sharedAppServer ||
+      this.#archivedThreadIds.has(threadId) ||
+      this.#sharedSubscribedThreads.has(threadId)
+    ) {
+      return;
+    }
+    const existing = this.#sharedSubscriptionPromises.get(threadId);
+    if (existing) {
+      await existing;
+      return;
+    }
+
+    const subscription = this.#resumeSharedThread(threadId);
+    this.#sharedSubscriptionPromises.set(threadId, subscription);
+    try {
+      await subscription;
+    } finally {
+      if (this.#sharedSubscriptionPromises.get(threadId) === subscription) {
+        this.#sharedSubscriptionPromises.delete(threadId);
+      }
+    }
+  }
+
+  async #resumeSharedThread(threadId: string): Promise<void> {
+    let lastError: unknown;
+    for (const delayMs of this.#sharedResumeDelaysMs) {
+      if (this.#archivedThreadIds.has(threadId) || this.#sharedSubscribedThreads.has(threadId)) {
+        return;
+      }
+      if (delayMs > 0) {
+        await delay(delayMs);
+      }
+      try {
+        const response = asRecord(
+          await this.#gateway.request("thread/resume", {
+            // Reconnect only needs a live subscription and metadata. Pulling
+            // every historical turn here can produce tens-of-megabytes frames
+            // for long Desktop conversations and repeatedly tear down the
+            // shared transport before the Sidecar becomes usable.
+            excludeTurns: true,
+            threadId,
+          }),
+        );
+        const resumedThread = asRecord(response.thread);
+        if (asString(resumedThread.id) !== threadId) {
+          throw new DomainError("THREAD_NOT_FOUND", "Thread not found", 404);
+        }
+        const thread = resumedThread;
+        if (this.#archivedThreadIds.has(threadId)) {
+          return;
+        }
+        this.#sharedSubscribedThreads.add(threadId);
+        this.#rememberDirectInput(threadId, thread);
+        this.#rememberRuntimeSettings(threadId, response);
+        this.#rememberUsageFromSource(threadId, response);
+        this.#rememberSharedThreadSnapshot(thread);
+        await this.#refreshProjectRegistry();
+        const projectId = this.#projectIdForCwd(thread.cwd);
+        const detail = projectThreadDetail(thread, {
+          directInputAvailable: this.#isDirectInputAvailable(threadId),
+          managed: true,
+          ...this.#pinnedProjectionOptions(threadId),
+          ...this.#runtimeProjectionOptions(threadId),
+          ...(projectId === undefined ? {} : { projectId }),
+        });
+        this.#restoredThreadsNeedingRefresh.delete(threadId);
+        this.#markExistingActiveTurnUncontrollable(detail);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("Unable to subscribe to the shared conversation yet");
+  }
+
+  async #refreshPinnedThreadIds(): Promise<void> {
+    if (this.#listPinnedThreadIds === undefined) {
+      return;
+    }
+    let threadIds: readonly string[] | undefined;
+    try {
+      threadIds = await this.#listPinnedThreadIds();
+    } catch {
+      return;
+    }
+    if (threadIds === undefined) {
+      return;
+    }
+    const nextRanks = new Map<string, number>();
+    for (const rawThreadId of threadIds) {
+      if (typeof rawThreadId !== "string") {
+        continue;
+      }
+      const threadId = rawThreadId.trim();
+      if (
+        threadId.length === 0 ||
+        threadId.length > 512 ||
+        nextRanks.has(threadId) ||
+        this.#archivedThreadIds.has(threadId)
+      ) {
+        continue;
+      }
+      nextRanks.set(threadId, nextRanks.size);
+      if (nextRanks.size >= MAX_PINNED_THREAD_SUPPLEMENTS) {
+        break;
+      }
+    }
+    this.#pinnedThreadRanks.clear();
+    for (const [threadId, rank] of nextRanks) {
+      this.#pinnedThreadRanks.set(threadId, rank);
+    }
+  }
+
+  async #readMissingPinnedThreads(
+    listedThreads: readonly Record<string, unknown>[],
+  ): Promise<Record<string, unknown>[]> {
+    const listedIds = new Set(
+      listedThreads
+        .map((thread) => asString(thread.id))
+        .filter((threadId): threadId is string => threadId !== undefined),
+    );
+    const missingThreadIds = [...this.#pinnedThreadRanks.entries()]
+      .sort((left, right) => left[1] - right[1])
+      .map(([threadId]) => threadId)
+      .filter(
+        (threadId) =>
+          !listedIds.has(threadId) &&
+          !this.#archivedThreadIds.has(threadId) &&
+          (!this.#sharedAppServer || this.#reconciledCurrentThreadIds.has(threadId)),
+      )
+      .slice(0, MAX_PINNED_THREAD_SUPPLEMENTS);
+    const snapshots: Array<Record<string, unknown> | undefined> = [];
+    for (
+      let offset = 0;
+      offset < missingThreadIds.length;
+      offset += PINNED_THREAD_READ_CONCURRENCY
+    ) {
+      const batch = missingThreadIds.slice(offset, offset + PINNED_THREAD_READ_CONCURRENCY);
+      snapshots.push(
+        ...(await Promise.all(
+          batch.map(async (threadId): Promise<Record<string, unknown> | undefined> => {
+            try {
+              const response = asRecord(
+                await this.#gateway.request("thread/read", {
+                  includeTurns: false,
+                  threadId,
+                }),
+              );
+              const thread = asRecord(response.thread);
+              return asString(thread.id) === threadId ? thread : undefined;
+            } catch {
+              return undefined;
+            }
+          }),
+        )),
+      );
+    }
+    return snapshots.filter((thread): thread is Record<string, unknown> => thread !== undefined);
+  }
+
+  #pinnedProjectionOptions(threadId: string): { pinnedRank?: number } {
+    const pinnedRank = this.#pinnedThreadRanks.get(threadId);
+    return pinnedRank === undefined ? {} : { pinnedRank };
+  }
+
+  #isGeneralConversationRoot(cwd: unknown): boolean {
+    const cwdKey = windowsPathKey(cwd);
+    if (cwdKey === undefined) return false;
+    return (
+      (this.#generalConversationRoot !== undefined &&
+        cwdKey === windowsPathKey(this.#generalConversationRoot)) ||
+      isNativeDesktopConversationRoot(cwdKey)
+    );
+  }
+
+  #projectIdForCwd(cwd: unknown): string | undefined {
+    const registeredProjectId = this.projects.findIdByCwd(cwd);
+    if (registeredProjectId !== undefined) return registeredProjectId;
+    return this.#isGeneralConversationRoot(cwd) ? undefined : undefined;
+  }
+}
+
+function permissionParams(mode: PermissionMode | undefined): Record<string, unknown> {
+  switch (mode) {
+    case "read-only":
+      return { approvalPolicy: "never", sandbox: "read-only" };
+    case "workspace-write":
+      return { approvalPolicy: "on-request", sandbox: "workspace-write" };
+    case "ask":
+      return { approvalPolicy: "untrusted", sandbox: "workspace-write" };
+    default:
+      return {};
+  }
+}
+
+function sanitizeProtocolOptions(options: readonly string[] | undefined): readonly string[] {
+  return [
+    ...new Set(
+      (options ?? []).filter(
+        (option) =>
+          typeof option === "string" &&
+          option.length > 0 &&
+          option.length <= 256 &&
+          option.trim() === option,
+      ),
+    ),
+  ];
+}
+
+function selectAllowedProtocolOptions(
+  restrictions: unknown,
+  protocolOptions: readonly string[],
+): string[] {
+  if (!Array.isArray(restrictions)) {
+    return [...protocolOptions];
+  }
+  return [
+    ...new Set(
+      restrictions.filter(
+        (option): option is string =>
+          typeof option === "string" &&
+          option.length > 0 &&
+          option.length <= 256 &&
+          option.trim() === option,
+      ),
+    ),
+  ];
+}
+
+type AppServerUserInput =
+  | { text: string; text_elements: []; type: "text" }
+  | { name: string; path: string; type: "mention" }
+  | { path: string; type: "localImage" };
+
+function textInput(text: string): { text: string; text_elements: []; type: "text" } {
+  return { text, text_elements: [], type: "text" };
+}
+
+function isImageAttachment(filePath: string): boolean {
+  return /\.(?:avif|gif|jpe?g|png|webp)$/iu.test(filePath);
+}
+
+async function delay(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, Math.max(0, milliseconds));
+  });
+}
+
+function collaborationUnavailable(): ServiceDegradation {
+  return {
+    code: "feature-unavailable",
+    feature: "collaboration-mode",
+    message:
+      "This Codex version does not support the selected collaboration mode; standard conversation is being used.",
+  };
+}
+
+function usageDegradation(message: string): ServiceDegradation {
+  return {
+    code: "temporarily-unavailable",
+    feature: "usage",
+    message,
+  };
+}
+
+function projectCodexAccountIdentity(
+  rawAccount: unknown,
+): NonNullable<UsageSnapshot["codexAccount"]> | undefined {
+  const account = asRecord(rawAccount);
+  const type = asString(account.type);
+  if (type !== "apiKey" && type !== "chatgpt" && type !== "amazonBedrock") {
+    return undefined;
+  }
+  if (type !== "chatgpt") {
+    return { type };
+  }
+  const email = boundedAccountEmail(account.email);
+  return email === undefined ? { type } : { email, type };
+}
+
+function boundedAccountEmail(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 320 ||
+    value.trim() !== value
+  ) {
+    return undefined;
+  }
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  })
+    ? undefined
+    : value;
+}
+
+function collaborationDisplayName(id: string): string {
+  switch (id) {
+    case "default":
+      return "Standard conversation";
+    case "plan":
+      return "Plan before execution";
+    default:
+      return id;
+  }
+}
+
+function usageRateLimitSnapshots(
+  rateLimitsResponse: Record<string, unknown>,
+): Array<[string, unknown]> {
+  const byId = asRecord(rateLimitsResponse.rateLimitsByLimitId);
+  return Object.keys(byId).length > 0
+    ? Object.entries(byId).slice(0, 64)
+    : [["codex", rateLimitsResponse.rateLimits]];
+}
+
+function projectUsageWindows(rateLimitsResponse: Record<string, unknown>): UsageWindow[] {
+  const windows: UsageWindow[] = [];
+
+  for (const [fallbackId, rawSnapshot] of usageRateLimitSnapshots(rateLimitsResponse)) {
+    const snapshot = asRecord(rawSnapshot);
+    const limitId = asString(snapshot.limitId) ?? fallbackId;
+    const label = asString(snapshot.limitName) ?? "Codex";
+    for (const [kind, rawWindow] of [
+      ["primary", snapshot.primary],
+      ["secondary", snapshot.secondary],
+    ] as const) {
+      const window = asRecord(rawWindow);
+      const usedPercent = asFiniteNumber(window.usedPercent);
+      if (usedPercent === undefined) {
+        continue;
+      }
+      const resetsAt = asFiniteNumber(window.resetsAt);
+      windows.push({
+        id: `${limitId}-${kind}`,
+        label: kind === "primary" ? `${label} · Current window` : `${label} · Longer window`,
+        usedPercent: clampPercent(usedPercent),
+        remainingPercent: clampPercent(100 - usedPercent),
+        ...(resetsAt === undefined ? {} : { resetsAt: new Date(resetsAt * 1_000).toISOString() }),
+      });
+    }
+  }
+  return windows;
+}
+
+function projectUsageCredits(rateLimitsResponse: Record<string, unknown>): UsageCredits[] {
+  const result: UsageCredits[] = [];
+  for (const [fallbackId, rawSnapshot] of usageRateLimitSnapshots(rateLimitsResponse)) {
+    const snapshot = asRecord(rawSnapshot);
+    const credits = asRecord(snapshot.credits);
+    if (typeof credits.hasCredits !== "boolean" || typeof credits.unlimited !== "boolean") {
+      continue;
+    }
+    const id =
+      boundedPlainString(snapshot.limitId, 128) ?? boundedPlainString(fallbackId, 128) ?? "codex";
+    const label = boundedPlainString(snapshot.limitName, 256) ?? "Codex";
+    const balance = boundedPlainString(credits.balance, 128);
+    result.push({
+      id,
+      label,
+      hasCredits: credits.hasCredits,
+      unlimited: credits.unlimited,
+      ...(balance === undefined ? {} : { balance }),
+    });
+  }
+  return result;
+}
+
+function projectAccountTokenUsageSummary(value: unknown): AccountTokenUsageSummary {
+  const summary = asRecord(value);
+  const lifetimeTokens = asUnsignedIntegerString(summary.lifetimeTokens);
+  const peakDailyTokens = asUnsignedIntegerString(summary.peakDailyTokens);
+  const longestRunningTurnSec = asSafeUnsignedInteger(summary.longestRunningTurnSec);
+  const currentStreakDays = asSafeUnsignedInteger(summary.currentStreakDays);
+  const longestStreakDays = asSafeUnsignedInteger(summary.longestStreakDays);
+  return {
+    ...(lifetimeTokens === undefined ? {} : { lifetimeTokens }),
+    ...(peakDailyTokens === undefined ? {} : { peakDailyTokens }),
+    ...(longestRunningTurnSec === undefined ? {} : { longestRunningTurnSec }),
+    ...(currentStreakDays === undefined ? {} : { currentStreakDays }),
+    ...(longestStreakDays === undefined ? {} : { longestStreakDays }),
+  };
+}
+
+function projectDailyTokenUsage(value: unknown): DailyTokenUsage[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return asRecordArray(value)
+    .slice(0, 400)
+    .flatMap((bucket) => {
+      const startDate = boundedPlainString(bucket.startDate, 32);
+      const tokens = asUnsignedIntegerString(bucket.tokens);
+      return startDate && tokens ? [{ startDate, tokens }] : [];
+    });
+}
+
+function projectThreadGoal(value: unknown, expectedThreadId: string): ThreadGoal {
+  const goal = asRecord(value);
+  const threadId = asString(goal.threadId);
+  const objective = boundedPlainString(goal.objective, 16_384);
+  const status = isThreadGoalStatus(goal.status) ? goal.status : undefined;
+  const tokensUsed = asSafeUnsignedInteger(goal.tokensUsed);
+  const timeUsedSeconds = asSafeUnsignedInteger(goal.timeUsedSeconds);
+  const createdAt = protocolTimestamp(goal.createdAt);
+  const updatedAt = protocolTimestamp(goal.updatedAt);
+  const tokenBudget =
+    goal.tokenBudget === null || goal.tokenBudget === undefined
+      ? undefined
+      : asSafeUnsignedInteger(goal.tokenBudget);
+  if (
+    threadId !== expectedThreadId ||
+    !objective ||
+    !status ||
+    tokensUsed === undefined ||
+    timeUsedSeconds === undefined ||
+    !createdAt ||
+    !updatedAt ||
+    (goal.tokenBudget !== null && goal.tokenBudget !== undefined && tokenBudget === undefined)
+  ) {
+    throw new DomainError(
+      "FEATURE_UNAVAILABLE",
+      "The current Codex returned an incompatible goal format.",
+      502,
+    );
+  }
+  return {
+    createdAt,
+    objective,
+    status,
+    threadId,
+    timeUsedSeconds,
+    tokensUsed,
+    updatedAt,
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
+  };
+}
+
+function isThreadGoalStatus(value: unknown): value is ThreadGoalStatus {
+  return (
+    value === "active" ||
+    value === "paused" ||
+    value === "blocked" ||
+    value === "usageLimited" ||
+    value === "budgetLimited" ||
+    value === "complete"
+  );
+}
+
+function protocolTimestamp(value: unknown): string | undefined {
+  const seconds = asFiniteNumber(value);
+  if (seconds === undefined || seconds < 0) {
+    return undefined;
+  }
+  try {
+    return new Date(seconds * 1_000).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+function boundedPlainString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const clean = Array.from(value)
+    .filter((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint === 9 || (codePoint >= 32 && codePoint !== 127);
+    })
+    .join("")
+    .trim();
+  return clean.length === 0 ? undefined : clean.slice(0, maxLength);
+}
+
+function asUnsignedIntegerString(value: unknown): string | undefined {
+  if (typeof value === "bigint") {
+    return value >= 0n ? value.toString() : undefined;
+  }
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^\d{1,64}$/u.test(value)) {
+    return value.replace(/^0+(?=\d)/u, "");
+  }
+  return undefined;
+}
+
+function asSafeUnsignedInteger(value: unknown): number | undefined {
+  const integer = asUnsignedIntegerString(value);
+  if (!integer) {
+    return undefined;
+  }
+  const parsed = Number(integer);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function calculateDepth(
+  thread: Record<string, unknown>,
+  rootThreadId: string,
+  byId: Map<string, Record<string, unknown>>,
+): number {
+  let depth = 1;
+  let parent = asString(thread.parentThreadId);
+  const seen = new Set<string>();
+  while (parent && !seen.has(parent)) {
+    if (parent === rootThreadId) {
+      return depth;
+    }
+    seen.add(parent);
+    const parentThread = byId.get(parent);
+    if (!parentThread) {
+      break;
+    }
+    depth += 1;
+    parent = asString(parentThread.parentThreadId);
+  }
+  return depth;
+}
+
+function preferredRuntimeSettingsSource(
+  turns: readonly Record<string, unknown>[],
+): Record<string, unknown> | undefined {
+  const candidates = turns.filter((turn) => hasRuntimeSettings(turn));
+  const active = candidates.filter((turn) => turn.status === "inProgress");
+  return (active.length > 0 ? active : candidates).sort(compareRuntimeTurns).at(-1);
+}
+
+function hasRuntimeSettings(turn: Record<string, unknown>): boolean {
+  return (
+    hasDirectRuntimeSetting(turn) ||
+    hasDirectRuntimeSetting(asRecord(turn.settings)) ||
+    hasDirectRuntimeSetting(asRecord(turn.turnSettings))
+  );
+}
+
+function hasDirectRuntimeSetting(source: Record<string, unknown>): boolean {
+  return (
+    Object.hasOwn(source, "model") ||
+    Object.hasOwn(source, "reasoningEffort") ||
+    Object.hasOwn(source, "effort") ||
+    Object.hasOwn(source, "reasoning_effort")
+  );
+}
+
+function compareRuntimeTurns(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftTimestamp =
+    asFiniteNumber(left.startedAt) ??
+    asFiniteNumber(left.createdAt) ??
+    asFiniteNumber(left.completedAt) ??
+    Number.NEGATIVE_INFINITY;
+  const rightTimestamp =
+    asFiniteNumber(right.startedAt) ??
+    asFiniteNumber(right.createdAt) ??
+    asFiniteNumber(right.completedAt) ??
+    Number.NEGATIVE_INFINITY;
+  if (leftTimestamp !== rightTimestamp) {
+    return leftTimestamp - rightTimestamp;
+  }
+  return (asString(left.id) ?? "").localeCompare(asString(right.id) ?? "", "en-US");
+}
+
+function isDescendantOf(
+  thread: Record<string, unknown>,
+  ancestorThreadId: string,
+  byId: Map<string, Record<string, unknown>>,
+): boolean {
+  let parent = asString(thread.parentThreadId);
+  const seen = new Set<string>();
+  while (parent && !seen.has(parent)) {
+    if (parent === ancestorThreadId) {
+      return true;
+    }
+    seen.add(parent);
+    parent = asString(byId.get(parent)?.parentThreadId);
+  }
+  return false;
+}
+
+function topLevelThreadId(
+  threadId: string,
+  byId: Map<string, Record<string, unknown>>,
+): string | undefined {
+  let currentThreadId = threadId;
+  const seen = new Set<string>();
+  while (!seen.has(currentThreadId)) {
+    seen.add(currentThreadId);
+    const thread = byId.get(currentThreadId);
+    if (thread === undefined) {
+      return undefined;
+    }
+    const parentThreadId = asString(thread.parentThreadId);
+    if (parentThreadId === undefined) {
+      return currentThreadId;
+    }
+    currentThreadId = parentThreadId;
+  }
+  return undefined;
+}
+
+function descendantCountsByRoot(byId: Map<string, Record<string, unknown>>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const threadId of byId.keys()) {
+    const rootThreadId = topLevelThreadId(threadId, byId);
+    if (rootThreadId === undefined || rootThreadId === threadId) {
+      continue;
+    }
+    counts.set(rootThreadId, (counts.get(rootThreadId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function rawThreadIsActive(thread: Record<string, unknown>): boolean {
+  const status = asRecord(thread.status);
+  const statusType = asString(status.type) ?? asString(thread.status);
+  if (statusType === "active") {
+    return true;
+  }
+  if (isTerminalThreadStatus(statusType)) {
+    return false;
+  }
+  return asRecordArray(thread.turns).some((turn) => turn.status === "inProgress");
+}
+
+function isTerminalThreadStatus(value: unknown): boolean {
+  const status = asString(asRecord(value).type) ?? asString(value);
+  return (
+    status === "idle" ||
+    status === "notLoaded" ||
+    status === "systemError" ||
+    status === "failed" ||
+    status === "complete" ||
+    status === "completed"
+  );
+}
+
+function isSharedThreadLifecycleNotification(method: string): boolean {
+  return (
+    method === "thread/status/changed" || method === "turn/started" || method === "turn/completed"
+  );
+}
+
+function normalizeSubagentLimit(limit: number | undefined): number {
+  return Math.min(Math.max(limit ?? 100, 1), 100);
+}
+
+function emptySubagentSnapshotDiscovery(): SubagentSnapshotDiscovery {
+  return {
+    historyIncomplete: false,
+    labels: new Map<string, string>(),
+    readCount: 0,
+    readDiagnosticMissing: false,
+    readFailureCount: 0,
+    referencedThreadIds: new Set<string>(),
+    threads: [],
+    traversalTruncated: false,
+  };
+}
+
+function threadHistoryReadDiagnostic(
+  response: Record<string, unknown>,
+): ThreadHistoryReadDiagnostic | undefined {
+  const diagnostic = asRecord(response.historyReadDiagnostic);
+  const observedCount = asSafeUnsignedInteger(diagnostic.observedCount);
+  const status = asString(diagnostic.status);
+  if (observedCount === undefined || (status !== "exhausted" && status !== "more-available")) {
+    return undefined;
+  }
+  return { observedCount, status };
+}
+
+function subagentCollectionFailed(collections: {
+  archived: SubagentStreamCollection;
+  current: SubagentStreamCollection;
+}): boolean {
+  return collections.archived.status === "failed" || collections.current.status === "failed";
+}
+
+function preferCompletedSubagentCollection(
+  primary: SubagentStreamCollection,
+  fallback: SubagentStreamCollection,
+): SubagentStreamCollection {
+  return fallback.status === "failed" ? primary : fallback;
+}
+
+function subagentHistoryIntegrity({
+  collections,
+  continuing,
+  data,
+  snapshotDiscovery,
+}: {
+  collections: {
+    archived: SubagentStreamCollection;
+    current: SubagentStreamCollection;
+  };
+  continuing: boolean;
+  data: readonly SubagentSummary[];
+  snapshotDiscovery: SubagentSnapshotDiscovery;
+}): SubagentHistoryIntegrity {
+  const streams: SubagentHistoryIntegrity["streams"] = {
+    archived: {
+      observedCount: collections.archived.threads.length,
+      status: collections.archived.status,
+    },
+    current: {
+      observedCount: collections.current.threads.length,
+      status: collections.current.status,
+    },
+  };
+  const observedCount = data.length;
+  if (subagentCollectionFailed(collections)) {
+    return {
+      observedCount,
+      reason: "pagination-failed",
+      status: observedCount === 0 ? "failed" : "partial",
+      streams,
+    };
+  }
+  if (
+    collections.archived.status === "more-available" ||
+    collections.current.status === "more-available"
+  ) {
+    return {
+      observedCount,
+      reason: "pagination-pending",
+      status: "partial",
+      streams,
+    };
+  }
+  if (continuing) {
+    return {
+      observedCount,
+      reason: "continuation-unverified",
+      status: "unknown",
+      streams,
+    };
+  }
+  if (snapshotDiscovery.readFailureCount > 0) {
+    return {
+      observedCount,
+      reason: "read-failed",
+      status: "unknown",
+      streams,
+    };
+  }
+  if (snapshotDiscovery.historyIncomplete || snapshotDiscovery.traversalTruncated) {
+    return {
+      observedCount,
+      reason: "read-truncated",
+      status: "partial",
+      streams,
+    };
+  }
+
+  const observedIds = new Set(data.map((subagent) => subagent.threadId));
+  const referencedIds = snapshotDiscovery.referencedThreadIds;
+  const evidenceMatches =
+    snapshotDiscovery.readCount > 0 &&
+    !snapshotDiscovery.readDiagnosticMissing &&
+    observedIds.size === referencedIds.size &&
+    [...observedIds].every((threadId) => referencedIds.has(threadId));
+  if (evidenceMatches) {
+    return {
+      observedCount,
+      reason: "verified-exhaustive",
+      status: "complete",
+      streams,
+    };
+  }
+
+  const requestedCollections = [collections.current, collections.archived].filter(
+    (collection) => collection.status !== "not-requested",
+  );
+  const isShortPage =
+    requestedCollections.length > 0 &&
+    requestedCollections.every(
+      (collection) =>
+        collection.status === "exhausted" && collection.threads.length < collection.requestedLimit,
+    );
+  return {
+    observedCount,
+    reason: isShortPage ? "upstream-short-page-without-cursor" : "verification-mismatch",
+    status: "unknown",
+    streams,
+  };
+}
+
+function subagentActivities(
+  thread: Record<string, unknown>,
+): Array<{ label?: string; threadId: string }> {
+  const activities: Array<{ label?: string; threadId: string }> = [];
+  for (const turn of asRecordArray(thread.turns)) {
+    for (const item of asRecordArray(turn.items)) {
+      if (item.type !== "subAgentActivity") continue;
+      const threadId = asString(item.agentThreadId);
+      if (!threadId) continue;
+      const label = asString(item.agentPath);
+      activities.push({ ...(label === undefined ? {} : { label }), threadId });
+    }
+  }
+  return activities;
+}
+
+function decodeSubagentCursor(cursor: string | undefined): SubagentCursorState {
+  if (cursor === undefined) {
+    return {};
+  }
+  if (!cursor.startsWith(SUBAGENT_CURSOR_PREFIX)) {
+    return { current: cursor };
+  }
+  try {
+    const encoded = cursor.slice(SUBAGENT_CURSOR_PREFIX.length);
+    const value: unknown = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("invalid cursor");
+    }
+    const record = value as Record<string, unknown>;
+    const current = asString(record.current);
+    const archived = asString(record.archived);
+    if (
+      (current === undefined && archived === undefined) ||
+      (current !== undefined && current.length > 4_096) ||
+      (archived !== undefined && archived.length > 4_096)
+    ) {
+      throw new Error("invalid cursor");
+    }
+    return {
+      ...(current === undefined ? {} : { current }),
+      ...(archived === undefined ? {} : { archived }),
+    };
+  } catch {
+    throw new DomainError("INVALID_INPUT", "Subagent pagination position is invalid", 400);
+  }
+}
+
+function encodeSubagentCursor(state: SubagentCursorState): string | undefined {
+  if (state.current === undefined && state.archived === undefined) {
+    return undefined;
+  }
+  return `${SUBAGENT_CURSOR_PREFIX}${Buffer.from(JSON.stringify(state), "utf8").toString(
+    "base64url",
+  )}`;
+}
+
+async function safeThreadProject(
+  cwd: unknown,
+  explicitRegistration = false,
+): Promise<RegisteredProject | undefined> {
+  const normalizedCwd = normalizeTrustedWindowsPath(cwd);
+  if (normalizedCwd === undefined) {
+    if (explicitRegistration) {
+      throw new DomainError(
+        "PROJECT_PATH_INVALID",
+        "The conversation has no valid absolute project path",
+        400,
+      );
+    }
+    return undefined;
+  }
+  try {
+    const canonical = normalizeTrustedWindowsPath(await realpath(normalizedCwd));
+    if (canonical === undefined) {
+      throw new DomainError("PROJECT_PATH_INVALID", "The resolved project path is invalid", 400);
+    }
+    const metadata = await stat(canonical);
+    if (!metadata.isDirectory() || isDangerousDiscoveredRoot(canonical)) {
+      if (explicitRegistration) {
+        throw new DomainError(
+          "PROJECT_DIRECTORY_INVALID",
+          "The project location is not an eligible directory",
+          403,
+        );
+      }
+      return undefined;
+    }
+    const id = createHash("sha256")
+      .update(canonical.toLocaleLowerCase("en-US"))
+      .digest("hex")
+      .slice(0, 16);
+    return {
+      id: `thread-${id}`,
+      name: path.win32.basename(canonical),
+      root: canonical,
+      source: "thread",
+    };
+  } catch (error) {
+    if (explicitRegistration) {
+      if (error instanceof DomainError) throw error;
+      const rawCode = asString(asRecord(error).code);
+      const code = rawCode && /^[A-Z0-9_]{1,64}$/u.test(rawCode) ? rawCode : "UNKNOWN";
+      const productCode =
+        code === "EACCES" || code === "EPERM"
+          ? "PROJECT_DIRECTORY_ACCESS_DENIED"
+          : code === "ENOENT" || code === "ENOTDIR"
+            ? "PROJECT_DIRECTORY_NOT_FOUND"
+            : "PROJECT_DIRECTORY_UNAVAILABLE";
+      throw new DomainError(productCode, `The project directory cannot be accessed [${code}]`, 403);
+    }
+    return undefined;
+  }
+}
+
+function normalizeTrustedWindowsPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 32_767) {
+    return undefined;
+  }
+  let candidate = value.replaceAll("/", "\\");
+  if (/^\\\\\?\\unc\\/iu.test(candidate)) {
+    candidate = `\\\\${candidate.slice(8)}`;
+  } else if (candidate.startsWith("\\\\?\\")) {
+    candidate = candidate.slice(4);
+  }
+  const isDriveAbsolute = /^[A-Za-z]:[\\/]/u.test(candidate);
+  const isUncAbsolute = /^\\\\[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(candidate);
+  if (!path.win32.isAbsolute(candidate) || (!isDriveAbsolute && !isUncAbsolute)) {
+    return undefined;
+  }
+  const normalized = path.win32.normalize(candidate);
+  const root = path.win32.parse(normalized).root;
+  return normalized.length > root.length ? normalized.replace(/[\\/]+$/u, "") : normalized;
+}
+
+function windowsPathKey(value: unknown): string | undefined {
+  return normalizeTrustedWindowsPath(value)?.toLocaleLowerCase("en-US");
+}
+
+function isNativeDesktopConversationRoot(cwdKey: string): boolean {
+  const desktopScratchRoot = windowsPathKey(path.win32.join(os.homedir(), "Documents", "Codex"));
+  if (desktopScratchRoot === undefined) return false;
+  const relation = path.win32.relative(desktopScratchRoot, cwdKey);
+  if (
+    relation.length === 0 ||
+    path.win32.isAbsolute(relation) ||
+    relation === ".." ||
+    relation.startsWith(`..${path.win32.sep}`)
+  ) {
+    return false;
+  }
+  const segments = relation.split(/[\\/]/u).filter(Boolean);
+  return segments.length === 2 && /^\d{4}-\d{2}-\d{2}$/u.test(segments[0] ?? "");
+}
+
+function isDangerousDiscoveredRoot(root: string): boolean {
+  const rootValidation = validateSafeWindowsProjectRoot(root);
+  if (!rootValidation.ok) {
+    return true;
+  }
+  const normalized = rootValidation.normalized.toLocaleLowerCase("en-US");
+  const driveRoot = path.win32.parse(normalized).root.toLocaleLowerCase("en-US");
+  if (normalized === driveRoot && /^[a-z]:\\/u.test(normalized)) {
+    return true;
+  }
+  const home = path.win32.resolve(os.homedir()).toLocaleLowerCase("en-US");
+  const broadRoots = [
+    home,
+    path.win32.dirname(home),
+    process.env.SystemRoot,
+    process.env.ProgramFiles,
+    process.env["ProgramFiles(x86)"],
+  ]
+    .filter((candidate): candidate is string => typeof candidate === "string")
+    .map((candidate) => path.win32.resolve(candidate).toLocaleLowerCase("en-US"));
+  return broadRoots.includes(normalized);
+}
+
+function sharedHistoryResumeError(error: unknown): DomainError {
+  if (error instanceof DomainError) {
+    return error;
+  }
+  const message = error instanceof Error ? error.message : "";
+  if (/Codex Desktop is not connected/iu.test(message)) {
+    return new DomainError(
+      "THREAD_READ_ONLY",
+      "Codex Desktop is not connected on the computer, so only history can be viewed.",
+      409,
+    );
+  }
+  if (/Thread subscription barrier failed/iu.test(message)) {
+    return new DomainError(
+      "THREAD_READ_ONLY",
+      "Desktop could not load this historical task in sync; keep Desktop open and try again.",
+      409,
+    );
+  }
+  if (/no rollout found|thread.+not found|conversation.+not found/iu.test(message)) {
+    return new DomainError(
+      "THREAD_NOT_FOUND",
+      "The local run record for this historical task cannot be restored yet; existing content remains viewable.",
+      404,
+    );
+  }
+  return new DomainError(
+    "THREAD_READ_ONLY",
+    "The current Codex version could not restore this historical task; existing content remains viewable.",
+    409,
+  );
+}
+
+function mergePersistedConversationItems(
+  protocolItems: readonly ConversationItem[],
+  persistedItems: readonly ConversationItem[],
+): ConversationItem[] {
+  const persisted = uniqueConversationItems(persistedItems);
+  const protocol = uniqueConversationItems(protocolItems);
+  const merged = [...persisted];
+  const persistedIds = new Set(persisted.map((item) => item.id));
+  const mergedIds = new Set(persistedIds);
+  const integratedProtocolIds = new Set<string>();
+
+  // The persisted rollout is the only source that can contain the beginning of
+  // a large child-agent conversation. Keep that sequence as the spine, while
+  // replacing overlapping records with the fresher app-server projection.
+  for (const protocolItem of protocol) {
+    const persistedIndex = merged.findIndex((item) => item.id === protocolItem.id);
+    if (persistedIndex < 0) continue;
+    merged[persistedIndex] = mergeConversationItemSnapshots(merged[persistedIndex]!, protocolItem);
+    integratedProtocolIds.add(protocolItem.id);
+  }
+
+  // Recent app-server pages and persisted JSONL records do not always reuse
+  // the same id for the same activity. Correlate the newest unmatched records
+  // backwards so a bounded protocol page replaces, rather than duplicates,
+  // the corresponding tail of a long persisted timeline.
+  const claimedSemanticIndexes = new Set<number>();
+  const protocolIds = new Set(protocol.map((item) => item.id));
+  for (let protocolIndex = protocol.length - 1; protocolIndex >= 0; protocolIndex -= 1) {
+    const protocolItem = protocol[protocolIndex]!;
+    if (integratedProtocolIds.has(protocolItem.id)) continue;
+    const semanticIndex = merged.findLastIndex(
+      (item, index) =>
+        !claimedSemanticIndexes.has(index) &&
+        !protocolIds.has(item.id) &&
+        samePersistedProtocolConversationItem(item, protocolItem),
+    );
+    if (semanticIndex < 0) continue;
+    const persistedAliasId = merged[semanticIndex]!.id;
+    merged[semanticIndex] = mergeConversationItemSnapshots(merged[semanticIndex]!, protocolItem);
+    claimedSemanticIndexes.add(semanticIndex);
+    mergedIds.delete(persistedAliasId);
+    mergedIds.add(protocolItem.id);
+    integratedProtocolIds.add(protocolItem.id);
+  }
+
+  for (let protocolIndex = 0; protocolIndex < protocol.length; protocolIndex += 1) {
+    const protocolItem = protocol[protocolIndex]!;
+    if (persistedIds.has(protocolItem.id) || integratedProtocolIds.has(protocolItem.id)) continue;
+
+    const previousAnchor = protocol
+      .slice(0, protocolIndex)
+      .findLast((candidate) => mergedIds.has(candidate.id));
+    const nextAnchor = protocol
+      .slice(protocolIndex + 1)
+      .find((candidate) => mergedIds.has(candidate.id));
+    const previousIndex =
+      previousAnchor === undefined ? -1 : merged.findIndex((item) => item.id === previousAnchor.id);
+    const nextIndex =
+      nextAnchor === undefined ? -1 : merged.findIndex((item) => item.id === nextAnchor.id);
+    const sameTurnIndex = sameTurnInsertionIndex(merged, protocolItem);
+
+    let insertionIndex: number;
+    if (
+      sameTurnIndex !== undefined &&
+      (protocolItem.kind === "user-message" ||
+        (protocolItem.kind === "assistant-message" && protocolItem.phase === "final_answer"))
+    ) {
+      insertionIndex = sameTurnIndex;
+    } else if (previousIndex >= 0 && (nextIndex < 0 || previousIndex < nextIndex)) {
+      insertionIndex = previousIndex + 1;
+    } else if (nextIndex >= 0) {
+      insertionIndex = nextIndex;
+    } else {
+      insertionIndex = sameTurnIndex ?? chronologicalInsertionIndex(merged, protocolItem);
+    }
+    merged.splice(insertionIndex, 0, protocolItem);
+    mergedIds.add(protocolItem.id);
+  }
+  return merged;
+}
+
+function samePersistedProtocolConversationItem(
+  persisted: ConversationItem,
+  protocol: ConversationItem,
+): boolean {
+  if (
+    persisted.turnId !== undefined &&
+    protocol.turnId !== undefined &&
+    persisted.turnId !== protocol.turnId
+  ) {
+    return false;
+  }
+  const persistedTimestamp = conversationItemTimestamp(persisted);
+  const protocolTimestamp = conversationItemTimestamp(protocol);
+  const sameKnownTurn =
+    persisted.turnId !== undefined &&
+    protocol.turnId !== undefined &&
+    persisted.turnId === protocol.turnId;
+  const nearTimestamp =
+    persistedTimestamp !== undefined &&
+    protocolTimestamp !== undefined &&
+    Math.abs(persistedTimestamp - protocolTimestamp) <= 10_000;
+  if (!sameKnownTurn && !nearTimestamp) return false;
+
+  if (persisted.kind === "tool" && protocol.kind === "tool") {
+    if (persisted.operation !== protocol.operation) return false;
+    return (
+      persisted.title === protocol.title ||
+      (persisted.operation !== "context-compaction" &&
+        persisted.title === "Use tool" &&
+        persisted.summary === undefined &&
+        persisted.detail === undefined)
+    );
+  }
+  if (persisted.kind === "file-change" && protocol.kind === "file-change") {
+    return (
+      conversationPathKey(persisted.path) === conversationPathKey(protocol.path) &&
+      persisted.change === protocol.change
+    );
+  }
+  if (persisted.kind === "subagent-activity" && protocol.kind === "subagent-activity") {
+    const persistedAgents = new Set(persisted.agents.map((agent) => agent.threadId));
+    return (
+      persisted.action === protocol.action &&
+      protocol.agents.some((agent) => persistedAgents.has(agent.threadId))
+    );
+  }
+  if (persisted.kind === "reasoning-summary" && protocol.kind === "reasoning-summary") {
+    return persisted.text === protocol.text;
+  }
+  if (persisted.kind === "assistant-message" && protocol.kind === "assistant-message") {
+    return persisted.phase === protocol.phase && persisted.text === protocol.text;
+  }
+  return false;
+}
+
+function conversationPathKey(value: string): string {
+  return value.replaceAll("\\", "/").toLocaleLowerCase("en-US");
+}
+
+function uniqueConversationItems(items: readonly ConversationItem[]): ConversationItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
+
+function mergeConversationItemSnapshots(
+  persisted: ConversationItem,
+  protocol: ConversationItem,
+): ConversationItem {
+  return {
+    ...persisted,
+    ...protocol,
+    ...(protocol.createdAt === undefined && persisted.createdAt !== undefined
+      ? { createdAt: persisted.createdAt }
+      : {}),
+    ...(protocol.turnId === undefined && persisted.turnId !== undefined
+      ? { turnId: persisted.turnId }
+      : {}),
+    ...(protocol.turnStartedAt === undefined && persisted.turnStartedAt !== undefined
+      ? { turnStartedAt: persisted.turnStartedAt }
+      : {}),
+    ...(protocol.turnCompletedAt === undefined && persisted.turnCompletedAt !== undefined
+      ? { turnCompletedAt: persisted.turnCompletedAt }
+      : {}),
+  } as ConversationItem;
+}
+
+function sameTurnInsertionIndex(
+  items: readonly ConversationItem[],
+  item: ConversationItem,
+): number | undefined {
+  if (item.turnId === undefined) return undefined;
+  const sameTurnIndexes = items.flatMap((candidate, index) =>
+    candidate.turnId === item.turnId ? [index] : [],
+  );
+  if (sameTurnIndexes.length === 0) return undefined;
+  const firstIndex = sameTurnIndexes[0]!;
+  const lastIndex = sameTurnIndexes.at(-1)!;
+  if (item.kind === "user-message") {
+    const lastUserIndex = sameTurnIndexes.findLast(
+      (index) => items[index]?.kind === "user-message",
+    );
+    return lastUserIndex === undefined ? firstIndex : lastUserIndex + 1;
+  }
+  if (item.kind === "assistant-message" && item.phase === "final_answer") {
+    return lastIndex + 1;
+  }
+  const finalBoundary = sameTurnIndexes.find((index) => {
+    const candidate = items[index];
+    return (
+      candidate?.kind === "formal-plan" ||
+      candidate?.kind === "interaction-record" ||
+      (candidate?.kind === "assistant-message" && candidate.phase === "final_answer")
+    );
+  });
+  return finalBoundary ?? lastIndex + 1;
+}
+
+function chronologicalInsertionIndex(
+  items: readonly ConversationItem[],
+  item: ConversationItem,
+): number {
+  const timestamp = conversationItemTimestamp(item);
+  if (timestamp === undefined) return items.length;
+  const laterIndex = items.findIndex((candidate) => {
+    const candidateTimestamp = conversationItemTimestamp(candidate);
+    return candidateTimestamp !== undefined && candidateTimestamp > timestamp;
+  });
+  return laterIndex < 0 ? items.length : laterIndex;
+}
+
+function conversationItemTimestamp(item: ConversationItem): number | undefined {
+  for (const value of [item.createdAt, item.turnStartedAt, item.turnCompletedAt]) {
+    if (value === undefined) continue;
+    const timestamp = Date.parse(value);
+    if (Number.isFinite(timestamp)) return timestamp;
+  }
+  return undefined;
+}
+
+function requireNonEmpty(value: string, label: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new DomainError("INVALID_INPUT", `${label} cannot be empty`, 400);
+  }
+  return trimmed;
+}
+
+function requireThreadName(value: string): string {
+  const name = requireNonEmpty(value, "conversation name");
+  if (name.length > MAX_THREAD_NAME_LENGTH) {
+    throw new DomainError(
+      "INVALID_INPUT",
+      `Conversation name cannot exceed ${MAX_THREAD_NAME_LENGTH} characters`,
+      400,
+    );
+  }
+  return name;
+}
+
+function normalizeArchiveIntent(intent: ArchiveIntent): ArchiveIntent | undefined {
+  if (
+    intent === null ||
+    typeof intent !== "object" ||
+    typeof intent.threadId !== "string" ||
+    intent.threadId.trim() !== intent.threadId ||
+    intent.threadId.length === 0 ||
+    intent.threadId.length > 512 ||
+    typeof intent.managed !== "boolean" ||
+    typeof intent.desktopNotificationPending !== "boolean" ||
+    typeof intent.targetArchived !== "boolean" ||
+    (!intent.managed && intent.desktopNotificationPending)
+  ) {
+    return undefined;
+  }
+  return {
+    desktopNotificationPending: intent.desktopNotificationPending,
+    managed: intent.managed,
+    targetArchived: intent.targetArchived,
+    threadId: intent.threadId,
+  };
+}
+
+function asReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  return typeof value === "string" &&
+    value.trim() === value &&
+    value.length > 0 &&
+    value.length <= 64
+    ? value
+    : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function isBrokerTurnStartConflict(error: unknown): boolean {
+  const record = asRecord(error);
+  return record.code === -32_094 && (record.method === undefined || record.method === "turn/start");
+}
+
+function asRecordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null && !Array.isArray(item),
+      )
+    : [];
+}
+
+function isInitialTurnSafelyTerminal(thread: Record<string, unknown>): boolean {
+  const status = asString(asRecord(thread.status).type) ?? asString(thread.status);
+  if (status === "active") {
+    return false;
+  }
+  switch (asString(asRecordArray(thread.turns).at(-1)?.status)) {
+    case "cancelled":
+    case "completed":
+    case "failed":
+    case "interrupted":
+      return hasPersistedTurnItem(thread);
+    default:
+      return false;
+  }
+}
+
+function hasPersistedTurnItem(thread: Record<string, unknown>): boolean {
+  return asRecordArray(thread.turns).some(hasPersistedItemInTurn);
+}
+
+function isIdleThreadWithoutPersistedItem(thread: Record<string, unknown>): boolean {
+  const status = asString(asRecord(thread.status).type) ?? asString(thread.status);
+  return status === "idle" && !hasPersistedTurnItem(thread);
+}
+
+function hasPersistedItemInTurn(turn: Record<string, unknown>): boolean {
+  return asRecordArray(turn.items).length > 0;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}

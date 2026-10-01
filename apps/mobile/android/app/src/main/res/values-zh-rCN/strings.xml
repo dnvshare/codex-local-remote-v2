@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Codex 远程控制</string>
+    <string name="title_activity_main">Codex 远程控制</string>
+    <string name="package_name">com.wlyaaaaa.codexlocalremote.mobile</string>
+    <string name="custom_url_scheme">com.wlyaaaaa.codexlocalremote.mobile</string>
+    <string name="runtime_log_path">日志文件：</string>
+    <string name="runtime_log_unavailable">不可用</string>
+    <string name="close">关闭</string>
+    <string name="renderer_process_exited">网页渲染进程已退出</string>
+    <string name="web_runtime_error">网页运行错误</string>
+</resources>
